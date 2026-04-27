@@ -1689,6 +1689,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
         alt_streams: Optional[List[torch.cuda.Stream]] = None,
+        routed_experts_quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -1722,6 +1723,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_stream=alt_streams[0] if alt_streams is not None else None,
             is_nextn=is_nextn,
             is_deepseek_v4=True,
+            routed_experts_quant_config=routed_experts_quant_config,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -1989,6 +1991,7 @@ class DeepseekV4Model(nn.Module):
         config: DeepSeekV4Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        routed_experts_quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.padding_id = config.pad_token_id
@@ -2012,6 +2015,7 @@ class DeepseekV4Model(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_streams=self.alt_streams,
+                routed_experts_quant_config=routed_experts_quant_config,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
@@ -2150,9 +2154,20 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.config = config
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
+        # Detect MXFP4 routed experts (e.g. DeepSeek-V4-Flash). The HF config
+        # declares expert_dtype="fp4" while the global quantization_config
+        # remains "fp8" for attention/shared experts. Build a separate
+        # Mxfp4Config so routed FusedMoE layers allocate at half-byte width.
+        self.routed_experts_quant_config = self._build_routed_experts_quant_config(
+            config, quant_config
+        )
+        self.routed_experts_mxfp4 = self.routed_experts_quant_config is not None
         self.determine_num_fused_shared_experts()
         self.model = DeepseekV4Model(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            routed_experts_quant_config=self.routed_experts_quant_config,
         )
         self.pp_group = get_pp_group()
         if config.tie_word_embeddings:
@@ -2187,6 +2202,22 @@ class DeepseekV4ForCausalLM(nn.Module):
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
 
+    @staticmethod
+    def _build_routed_experts_quant_config(
+        config: "DeepSeekV4Config",
+        quant_config: Optional[QuantizationConfig],
+    ) -> Optional[QuantizationConfig]:
+        # Only V4-Flash-style mixed quantization: MXFP4 routed experts +
+        # FP8 attention/shared experts. Guard tightly to avoid colliding with
+        # W4AFP8 or other future schemes.
+        if getattr(config, "expert_dtype", None) != "fp4":
+            return None
+        if quant_config is None or quant_config.get_name() != "fp8":
+            return None
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
+
+        return Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
+
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
         if get_global_server_args().disable_shared_experts_fusion:
@@ -2215,6 +2246,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
         ):
             disable_reason = "2604 routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
+        elif getattr(self, "routed_experts_mxfp4", False):
+            disable_reason = "MXFP4 routed experts (expert_dtype=fp4) require shared experts to remain FP8; fusion would mix quantization formats."
 
         if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
             disable_reason = "2604B checkpoint requires different clamping for shared and routed experts"
@@ -2314,9 +2347,11 @@ class DeepseekV4ForCausalLM(nn.Module):
                 self_attn.indexer.compressor.apply_ape_hotfix()
 
     # This is used externally, please try to keep the API mostly unchanged
-    @staticmethod
     def remap_weight_name_to_dpsk_hf_format(
-        name: str, is_nextn: bool = False, num_hidden_layers: Optional[int] = None
+        self,
+        name: str,
+        is_nextn: bool = False,
+        num_hidden_layers: Optional[int] = None,
     ) -> str:
         if name == "embed.weight":
             return "model.embed_tokens.weight"
@@ -2375,7 +2410,17 @@ class DeepseekV4ForCausalLM(nn.Module):
             name = name.replace(".w2.", ".down_proj.")
             name = name.replace(".w3.", ".up_proj.")
             if "mlp" in name:
-                name = name.replace(".scale", ".weight_scale_inv")
+                # Routed MXFP4 experts use `weight_scale` (no `_inv`) to match
+                # Mxfp4MoEMethod's parameter names. Shared experts and other
+                # MLPs keep the FP8 block-quant `weight_scale_inv` convention.
+                if (
+                    getattr(self, "routed_experts_mxfp4", False)
+                    and ".experts." in name
+                    and ".shared_experts." not in name
+                ):
+                    name = name.replace(".scale", ".weight_scale")
+                else:
+                    name = name.replace(".scale", ".weight_scale_inv")
 
         return name
 
@@ -2720,6 +2765,22 @@ class DeepseekV4ForCausalLM(nn.Module):
                 raise RuntimeError(
                     f"Some weights are not initialized from checkpoints: {unloaded_params}"
                 )
+
+        # Phase-0 instrumentation: report per-rank memory after weights are
+        # copied but before any post-processing pass that might upcast.
+        if os.environ.get("SGLANG_PHASE0_MEMLOG", "0") == "1":
+            try:
+                import torch as _torch
+
+                allocated = _torch.cuda.memory_allocated() / 1e9
+                reserved = _torch.cuda.memory_reserved() / 1e9
+                logger.info(
+                    "[phase0-memlog] post-load_weights, pre-post-processing: "
+                    f"allocated={allocated:.2f} GB, reserved={reserved:.2f} GB, "
+                    f"is_nextn={is_nextn}"
+                )
+            except Exception:
+                pass
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 

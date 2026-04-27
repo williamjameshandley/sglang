@@ -449,6 +449,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
+        # Phase-0 escape hatch: skip post-processing entirely so packed MXFP4
+        # weights stay at half-byte width. The default no-backend branch
+        # upcasts to BF16, which inflates memory back above the FP8 baseline
+        # and defeats the allocation diagnosis. Production runs must remove
+        # this guard once a real sm_120 MXFP4 GEMM path is wired up.
+        import os as _os
+
+        if _os.environ.get("SGLANG_MXFP4_SKIP_POST_LOAD", "0") == "1":
+            return
         if self.use_flashinfer:
             # TODO: these values are hardcoded for now, we need to get them from the model
             layer.gemm1_alpha = Parameter(

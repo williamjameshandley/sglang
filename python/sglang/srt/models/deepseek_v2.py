@@ -370,12 +370,17 @@ class DeepseekV2MoE(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
         is_nextn: bool = False,
         is_deepseek_v4: bool = False,
+        routed_experts_quant_config: Optional[QuantizationConfig] = None,
     ):
         super().__init__()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
+        # Optional override: routed FusedMoE uses this quant config (e.g. MXFP4
+        # for V4-Flash routed experts) while shared experts stay on the base
+        # quant_config (FP8). When None, behavior is unchanged.
+        routed_quant_config = routed_experts_quant_config or quant_config
 
         n_shared_experts = (
             0 if config.n_shared_experts is None else int(config.n_shared_experts)
@@ -453,7 +458,7 @@ class DeepseekV2MoE(nn.Module):
             # with fused_shared_experts
             fused_shared_experts_scaling_factor = 1.0 / float(self.moe_ep_size)
 
-        self.experts = get_moe_impl_class(quant_config)(
+        self.experts = get_moe_impl_class(routed_quant_config)(
             num_experts=num_experts_for_moe
             + get_global_server_args().ep_num_redundant_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
@@ -461,7 +466,7 @@ class DeepseekV2MoE(nn.Module):
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=self.layer_id,
-            quant_config=quant_config,
+            quant_config=routed_quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             routing_method_type=getattr(
                 config, "routing_method_type", RoutingMethodType.DeepSeekV3
@@ -1655,6 +1660,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         is_nextn: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        routed_experts_quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1720,6 +1726,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
                 is_nextn=is_nextn,
+                routed_experts_quant_config=routed_experts_quant_config,
             )
         else:
             if enable_moe_dense_fully_dp():

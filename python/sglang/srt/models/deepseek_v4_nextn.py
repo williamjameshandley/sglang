@@ -39,6 +39,7 @@ class DeepseekV4ModelNextN(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        routed_experts_quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -96,6 +97,7 @@ class DeepseekV4ModelNextN(nn.Module):
             is_nextn=True,
             prefix=add_prefix(layer_name, prefix),
             alt_streams=None,
+            routed_experts_quant_config=routed_experts_quant_config,
         )
 
         self.shared_head = nn.Module()
@@ -209,11 +211,18 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.pp_group = get_pp_group()
         self.quant_config = quant_config
+        self.routed_experts_quant_config = self._build_routed_experts_quant_config(
+            config, quant_config
+        )
+        self.routed_experts_mxfp4 = self.routed_experts_quant_config is not None
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.determine_num_fused_shared_experts()
 
         self.model = DeepseekV4ModelNextN(
-            config, quant_config, prefix=add_prefix("model", prefix)
+            config,
+            quant_config,
+            prefix=add_prefix("model", prefix),
+            routed_experts_quant_config=self.routed_experts_quant_config,
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
