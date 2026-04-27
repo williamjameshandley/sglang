@@ -230,10 +230,19 @@ class Mxfp4Config(QuantizationConfig):
         self,
         ignored_layers: Optional[list[str]] = None,
         is_checkpoint_mxfp4_serialized: bool = False,
+        load_transposed: bool = True,
     ):
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers
+        # GPT-OSS-style MXFP4 checkpoints store routed expert weights as
+        # `[hidden, intermediate]` and rely on the FusedMoE loader to
+        # transpose to the registered `[intermediate, hidden//2]` layout
+        # at load time (layer.py:466-471). DeepSeek-V4-Flash stores routed
+        # expert weights already in the registered layout, so the
+        # transpose must be skipped for it. Default True preserves the
+        # existing GPT-OSS behaviour.
+        self.load_transposed = load_transposed
 
     @classmethod
     def from_config(cls, config):
@@ -707,11 +716,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
-            w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
-            w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
-
-            layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
-            layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
+            w13_weight_bias = getattr(layer, "w13_weight_bias", None)
+            if w13_weight_bias is not None:
+                layer.w13_weight_bias = Parameter(
+                    w13_weight_bias.to(torch.float32), requires_grad=False
+                )
+            w2_weight_bias = getattr(layer, "w2_weight_bias", None)
+            if w2_weight_bias is not None:
+                layer.w2_weight_bias = Parameter(
+                    w2_weight_bias.to(torch.float32), requires_grad=False
+                )
 
             num_warps = 8
 

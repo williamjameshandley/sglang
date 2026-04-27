@@ -2216,7 +2216,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             return None
         from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 
-        return Mxfp4Config(is_checkpoint_mxfp4_serialized=True)
+        # V4-Flash stores routed expert weights/scales already in the
+        # registered `[intermediate, hidden//2]` / `[intermediate, hidden//32]`
+        # layout, unlike GPT-OSS-MXFP4 which requires the FusedMoE loader
+        # transpose at layer.py:466-471. Disable that transpose.
+        return Mxfp4Config(
+            is_checkpoint_mxfp4_serialized=True,
+            load_transposed=False,
+        )
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0

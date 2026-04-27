@@ -661,8 +661,13 @@ class ModelRunnerKVCacheMixin:
                         need_sort=need_sort,
                     )
                 elif is_v4_model:
-                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                    from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+                        DeepSeekV4TokenToKVPoolAllocator,
+                    )
+
+                    self.token_to_kv_pool_allocator = DeepSeekV4TokenToKVPoolAllocator(
                         self.max_total_num_tokens,
+                        size_swa=self.swa_max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
                         device=self.device,

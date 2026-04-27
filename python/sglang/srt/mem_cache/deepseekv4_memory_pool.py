@@ -858,3 +858,263 @@ class DeepSeekV4TokenToKVPool(KVCache):
     #   - c4 / c128 / c4_indexer
     #   - swa_kv_pool: shape (num_pages, pages * bytes_per_page), where num_pages = max_num_reqs
     # - PagedTokenToKVAllocator
+
+
+class DeepSeekV4TokenToKVPoolAllocator:
+    """V4-aware allocator that owns separate full and SWA paged allocators
+    plus the `full_to_swa_index_mapping` consumed by
+    `DeepSeekV4TokenToKVPool.translate_loc_from_full_to_swa`.
+
+    Mirrors :class:`SWATokenToKVPoolAllocator` (mem_cache/swa_memory_pool.py),
+    retargeted to V4's pool layout: the SWA storage is the parent V4 pool's
+    ``swa_kv_pool`` attribute rather than a separately managed pool.
+
+    Both inner allocators share the same ``page_size`` so the canonical
+    ``alloc_extend`` / ``alloc_decode`` page-alignment contracts hold. V4's
+    parent pool internally subdivides its SWA storage by ``swa_page_size``
+    (with ``page_size % swa_page_size == 0``); the allocator presents the
+    coarser ``page_size`` view, which costs some SWA capacity but avoids
+    any page-size mismatch in the alloc/free logic.
+    """
+
+    def __init__(
+        self,
+        size: int,
+        size_swa: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: "DeepSeekV4TokenToKVPool",
+        need_sort: bool,
+    ):
+        from sglang.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
+
+        assert isinstance(kvcache, DeepSeekV4TokenToKVPool)
+        # Both inner allocators share `page_size`; the SWA inner pool must
+        # be paginated at the same size so allocator-level indices line up
+        # with the underlying KV-cache page layout. V4 enforces
+        # `page_size % swa_page_size == 0` at the pool level, but here we
+        # require strict equality because we drive the SWA pool through
+        # this allocator's page arithmetic.
+        assert kvcache.swa_kv_pool.page_size == page_size, (
+            f"DeepSeekV4TokenToKVPoolAllocator requires "
+            f"kvcache.swa_kv_pool.page_size == page_size, got "
+            f"{kvcache.swa_kv_pool.page_size} vs {page_size}"
+        )
+        self._size_full = size
+        self._size_swa = size_swa
+        self.dtype = dtype
+        self.device = device
+        self.page_size = page_size
+        self.need_sort = need_sort
+
+        self.full_attn_allocator = PagedTokenToKVPoolAllocator(
+            size,
+            page_size,
+            dtype,
+            device,
+            kvcache,
+            need_sort,
+        )
+        self.swa_attn_allocator = PagedTokenToKVPoolAllocator(
+            size_swa,
+            page_size,
+            dtype,
+            device,
+            kvcache.swa_kv_pool,
+            need_sort,
+        )
+
+        # Note: append one more item of value -1 in the end so -1 maps to -1.
+        # Required because get_swa_page_indices() (deepseek_v4_backend_radix
+        # line 1234-1239) marks invalid offsets as -1 before calling
+        # translate_loc_from_full_to_swa, expecting -1 to stay -1.
+        self.full_to_swa_index_mapping = torch.cat(
+            [
+                torch.zeros(size + page_size, dtype=torch.int64, device=device),
+                torch.tensor([-1], dtype=torch.int64, device=device),
+            ]
+        )
+
+        self.is_not_in_free_group = True
+        self.free_group: List[torch.Tensor] = []
+
+        self.clear()
+        self._kvcache = kvcache
+        self._kvcache.register_mapping(self.full_to_swa_index_mapping)
+
+    @property
+    def size(self) -> int:
+        return min(self._size_full, self._size_swa)
+
+    @property
+    def size_full(self) -> int:
+        return self._size_full
+
+    @property
+    def size_swa(self) -> int:
+        return self._size_swa
+
+    def available_size(self) -> int:
+        return min(
+            self.full_attn_allocator.available_size(),
+            self.swa_attn_allocator.available_size(),
+        )
+
+    def full_available_size(self) -> int:
+        return self.full_attn_allocator.available_size()
+
+    def swa_available_size(self) -> int:
+        return self.swa_attn_allocator.available_size()
+
+    def get_kvcache(self) -> "DeepSeekV4TokenToKVPool":
+        return self._kvcache
+
+    def debug_print(self) -> str:
+        return (
+            f"#full-attn-available-size: {self.full_attn_allocator.available_size()}, "
+            f"#swa-available-size: {self.swa_attn_allocator.available_size()}"
+        )
+
+    def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor) -> torch.Tensor:
+        return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
+
+    def alloc(self, need_size: int):
+        if need_size > self.full_attn_allocator.available_size():
+            return None
+        if need_size > self.swa_attn_allocator.available_size():
+            return None
+
+        alloc_full_indices = self.full_attn_allocator.alloc(need_size)
+        alloc_swa_indices = self.swa_attn_allocator.alloc(need_size)
+        assert alloc_full_indices is not None
+        assert alloc_swa_indices is not None
+
+        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        return alloc_full_indices
+
+    def alloc_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        from sglang.srt.mem_cache.allocator import get_num_new_pages
+
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu,
+            page_size=self.page_size,
+            prefix_lens=prefix_lens_cpu,
+        )
+        if num_new_pages > self.full_attn_allocator.available_size() // self.page_size:
+            return None
+        if num_new_pages > self.swa_attn_allocator.available_size() // self.page_size:
+            return None
+
+        swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
+
+        alloc_full_indices = self.full_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+        alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            swa_last_loc,
+            extend_num_tokens,
+        )
+        assert alloc_full_indices is not None
+        assert alloc_swa_indices is not None
+
+        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        return alloc_full_indices
+
+    def alloc_decode(
+        self,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+    ):
+        swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
+
+        alloc_full_indices = self.full_attn_allocator.alloc_decode(
+            seq_lens, seq_lens_cpu, last_loc
+        )
+        alloc_swa_indices = self.swa_attn_allocator.alloc_decode(
+            seq_lens, seq_lens_cpu, swa_last_loc
+        )
+
+        if alloc_full_indices is None or alloc_swa_indices is None:
+            return None
+
+        self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+        return alloc_full_indices
+
+    def free(self, free_index: torch.Tensor) -> None:
+        if free_index.numel() == 0:
+            return
+
+        if self.is_not_in_free_group:
+            self.full_attn_allocator.free(free_index)
+            self.free_swa(free_index)
+        else:
+            self.free_group.append(free_index)
+
+        assert (
+            self.full_attn_allocator.available_size()
+            <= self.full_attn_allocator.size
+        )
+        assert (
+            self.swa_attn_allocator.available_size()
+            <= self.swa_attn_allocator.size
+        )
+
+    def free_swa(self, free_index: torch.Tensor) -> None:
+        swa_indices = self.full_to_swa_index_mapping[free_index]
+        swa_indices = swa_indices[swa_indices > 0]
+        self.swa_attn_allocator.free(swa_indices)
+        self.full_to_swa_index_mapping[free_index] = 0
+
+    def free_group_begin(self) -> None:
+        self.is_not_in_free_group = False
+        self.free_group = []
+
+    def free_group_end(self) -> None:
+        self.is_not_in_free_group = True
+        if self.free_group:
+            self.free(torch.cat(self.free_group))
+        self.free_group = []
+
+    def backup_state(self):
+        return [
+            self.full_attn_allocator.backup_state(),
+            self.swa_attn_allocator.backup_state(),
+        ]
+
+    def restore_state(self, state) -> None:
+        assert len(state) == 2
+        self.full_attn_allocator.restore_state(state[0])
+        self.swa_attn_allocator.restore_state(state[1])
+
+    def clear(self) -> None:
+        self.full_attn_allocator.clear()
+        self.swa_attn_allocator.clear()
+        # Last item is the -1 sentinel; preserve it.
+        self.full_to_swa_index_mapping[:-1].fill_(0)
+        self.is_not_in_free_group = True
+        self.free_group = []
+
+    def get_cpu_copy(self, indices):
+        return self._kvcache.get_cpu_copy(indices)
+
+    def load_cpu_copy(self, kv_cache_cpu, indices):
+        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)

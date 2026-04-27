@@ -463,7 +463,11 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not self.use_presharded_weights:
-                if not is_bias and self.use_triton_kernels:
+                if (
+                    not is_bias
+                    and self.use_triton_kernels
+                    and getattr(self.quant_config, "load_transposed", True)
+                ):
                     # do not transpose for bias
                     loaded_weight = loaded_weight.transpose(-2, -1)
                 loaded_weight = loaded_weight.narrow(
@@ -532,8 +536,22 @@ class FusedMoE(torch.nn.Module):
             )
         else:
             if not is_bias and not self.use_presharded_weights:
-                if self.use_triton_kernels:
+                if self.use_triton_kernels and getattr(
+                    self.quant_config, "load_transposed", True
+                ):
                     loaded_weight = loaded_weight.transpose(-2, -1)
+                import os as _os
+                if _os.environ.get("SGLANG_PHASE3_TRACE", "0") == "1":
+                    import logging as _logging
+                    _logging.getLogger(__name__).info(
+                        "[phase3-trace] _load_w2: "
+                        f"expert_data.shape={tuple(expert_data.shape)} "
+                        f"loaded_weight.shape={tuple(loaded_weight.shape)} "
+                        f"shard_dim={shard_dim} shard_size={shard_size} "
+                        f"tp_rank={tp_rank} "
+                        f"use_triton_kernels={self.use_triton_kernels} "
+                        f"load_transposed={getattr(self.quant_config, 'load_transposed', '<missing>')}"
+                    )
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
@@ -792,7 +810,9 @@ class FusedMoE(torch.nn.Module):
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
         shard_dim = SHARD_ID_TO_SHARDED_DIM[shard_id]
-        if self.use_triton_kernels:
+        if self.use_triton_kernels and getattr(
+            self.quant_config, "load_transposed", True
+        ):
             is_transposed = True
         if is_transposed:
             shard_dim = int(not shard_dim)
@@ -1003,7 +1023,9 @@ class FusedMoE(torch.nn.Module):
         # should be whatever dimension intermediate_size is
         is_transposed = getattr(param, "is_transposed", False)
 
-        if self.use_triton_kernels:
+        if self.use_triton_kernels and getattr(
+            self.quant_config, "load_transposed", True
+        ):
             is_transposed = True
         shard_dim = (
             SHARD_ID_TO_SHARDED_DIM[shard_id]
