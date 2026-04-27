@@ -525,9 +525,22 @@ class DeepSeekV4TokenToKVPool(KVCache):
             self._init_compress_states()
 
         self._should_cache_swa = envs.SGLANG_OPT_CACHE_SWA_TRANSLATION.get()
+        self.swa_loc: Optional[torch.Tensor] = None
 
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
+
+    def set_swa_loc(self, loc: torch.Tensor) -> None:
+        """Stash an already-SWA-translated loc tensor that subsequent
+        per-layer set_swa_key_buffer_radix[_fused] calls will use directly,
+        skipping the per-call translate_loc_from_full_to_swa.
+
+        Mirrors SWAKVPool.set_swa_loc (mem_cache/swa_memory_pool.py:146).
+        Called by model_runner._forward_raw (eager) and
+        cuda_graph_runner.capture_one_batch_size with
+        forward_batch.out_cache_loc_swa, which is already SWA-space.
+        """
+        self.swa_loc = loc
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
@@ -811,7 +824,10 @@ class DeepSeekV4TokenToKVPool(KVCache):
         raw_loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ) -> None:
-        swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
+        if self.swa_loc is not None:
+            swa_loc = self.swa_loc
+        else:
+            swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
         self.swa_kv_pool.set_key_buffer(
             layer_id, swa_loc, cache_nope_fp8_rope_bf16_pack
         )
@@ -826,7 +842,9 @@ class DeepSeekV4TokenToKVPool(KVCache):
         raw_loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        if self._should_cache_swa:
+        if self.swa_loc is not None:
+            swa_loc = self.swa_loc
+        elif self._should_cache_swa:
             if layer_id == 0:
                 self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
             swa_loc = self.cached_loc
