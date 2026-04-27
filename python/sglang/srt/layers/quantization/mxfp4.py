@@ -332,12 +332,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         with_bias: bool = False,
         **extra_weight_attrs,
     ):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+
         self.num_experts = num_experts
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
         self.with_bias = with_bias
         mxfp4_block = 32
         triton_kernels_padding_alignment = 64
+        scale_attrs = {
+            **extra_weight_attrs,
+            "quant_method": FusedMoeWeightScaleSupported.GROUP.value,
+        }
 
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
@@ -395,18 +401,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
-        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w13_weight_scale, scale_attrs)
 
-        w13_weight_bias = torch.nn.Parameter(
-            torch.zeros(
-                layer.num_local_experts,
-                2 * intermediate_size_per_partition_after_pad,
-                dtype=torch.bfloat16,
-            ),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight_bias", w13_weight_bias)
-        set_weight_attrs(w13_weight_bias, extra_weight_attrs)
+        if with_bias:
+            w13_weight_bias = torch.nn.Parameter(
+                torch.zeros(
+                    layer.num_local_experts,
+                    2 * intermediate_size_per_partition_after_pad,
+                    dtype=torch.bfloat16,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_bias", w13_weight_bias)
+            set_weight_attrs(w13_weight_bias, extra_weight_attrs)
 
         # down_proj (row parallel)
         w2_weight = torch.nn.Parameter(
@@ -431,14 +438,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+        set_weight_attrs(w2_weight_scale, scale_attrs)
 
-        w2_weight_bias = torch.nn.Parameter(
-            torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
-            requires_grad=False,
-        )
-        layer.register_parameter("w2_weight_bias", w2_weight_bias)
-        set_weight_attrs(w2_weight_bias, extra_weight_attrs)
+        if with_bias:
+            w2_weight_bias = torch.nn.Parameter(
+                torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_bias", w2_weight_bias)
+            set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer):
         if self.use_flashinfer:
