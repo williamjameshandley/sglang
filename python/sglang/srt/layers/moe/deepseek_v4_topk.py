@@ -30,7 +30,60 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
-from sglang.srt.layers.moe.topk import StandardTopKOutput, _mask_topk_ids_padded_region
+from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TritonKernelTopKOutput,
+    _mask_topk_ids_padded_region,
+)
+
+
+def _to_triton_kernels_format(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    router_logits: torch.Tensor,
+    n_expts_tot: int,
+    n_expts_act: int,
+    num_token_non_padded: Optional[torch.Tensor],
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
+) -> TritonKernelTopKOutput:
+    """Convert HashTopK's StandardTopKOutput to TritonKernelTopKOutput.
+
+    Re-uses HashTopK's already-computed `topk_ids` to derive the bitmatrix,
+    and threads HashTopK's `topk_weights` through `routing_from_bitmatrix`
+    so they survive into `RoutingData.gate_scal`. We do NOT call
+    `routing(router_logits, expt_indx=topk_ids)` because that path
+    re-derives weights from selected-logit softmax, discarding HashTopK's
+    scoring (per gpt-5.5 review NOT APPROVED for the naive path).
+    """
+    assert num_token_non_padded is None, (
+        "HashTopK->TritonKernel conversion does not support padded-region "
+        "masking; -1 indices in topk_ids would corrupt the bitmatrix"
+    )
+    assert expert_location_dispatch_info is None, (
+        "HashTopK->TritonKernel conversion does not support EPLB "
+        "(logical->physical ID remap); router_logits columns are logical, "
+        "gathering via physical IDs would index wrong columns"
+    )
+
+    from triton_kernels.routing import routing_from_bitmatrix
+    from triton_kernels.topk import topk_forward
+
+    y_indx_i16 = topk_ids.to(torch.int16)
+    _, _, bitmatrix = topk_forward(
+        router_logits,
+        n_expts_act,
+        apply_softmax=False,
+        y_indx=y_indx_i16,
+    )
+    routing_data, gather_idx, scatter_idx = routing_from_bitmatrix(
+        bitmatrix,
+        topk_weights,
+        y_indx_i16,
+        n_expts_tot,
+        n_expts_act,
+    )
+    return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
 
 
 class HashTopK(nn.Module):
@@ -147,10 +200,25 @@ class HashTopK(nn.Module):
 
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
-        topk_output = StandardTopKOutput(
+
+        if get_moe_runner_backend().is_triton_kernels():
+            assert self.num_fused_shared_experts == 0, (
+                "HashTopK->TritonKernel conversion does not support fused "
+                "shared experts (IDs >= n_routed_experts)"
+            )
+            return _to_triton_kernels_format(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=router_logits,
+                n_expts_tot=router_logits.shape[-1],
+                n_expts_act=topk_weights.shape[-1],
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
+
+        return StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
-        return topk_output
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
