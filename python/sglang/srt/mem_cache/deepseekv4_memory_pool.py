@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.compress_state import (
     KVAndScore,
 )
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import ceil_div
 
@@ -860,7 +861,7 @@ class DeepSeekV4TokenToKVPool(KVCache):
     # - PagedTokenToKVAllocator
 
 
-class DeepSeekV4TokenToKVPoolAllocator:
+class DeepSeekV4TokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """V4-aware allocator that owns separate full and SWA paged allocators
     plus the `full_to_swa_index_mapping` consumed by
     `DeepSeekV4TokenToKVPool.translate_loc_from_full_to_swa`.
