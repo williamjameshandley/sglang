@@ -530,7 +530,7 @@ class DeepSeekV4TokenToKVPool(KVCache):
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor):
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
-    def set_swa_loc(self, loc: torch.Tensor) -> None:
+    def set_swa_loc(self, loc: Optional[torch.Tensor]) -> None:
         """Stash an already-SWA-translated loc tensor that subsequent
         per-layer set_swa_key_buffer_radix[_fused] calls will use directly,
         skipping the per-call translate_loc_from_full_to_swa.
