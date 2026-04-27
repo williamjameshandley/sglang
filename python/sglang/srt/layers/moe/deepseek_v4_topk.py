@@ -69,6 +69,51 @@ def _to_triton_kernels_format(
     from triton_kernels.routing import routing_from_bitmatrix
     from triton_kernels.topk import topk_forward
 
+    # Uniqueness within each token's real top-k is required: routing_from_
+    # bitmatrix derives the per-expert histogram from the bitmatrix (binary
+    # per (token, expert)) but reads the gate list as N*k entries. Duplicates
+    # would make hist undercount vs gate list and corrupt routing offsets.
+    # HashTopK's tid2eid table is designed to dispatch each token to distinct
+    # experts; assert it for clean failure on violation.
+    sorted_ids, _ = topk_ids.sort(dim=1)
+    assert not (
+        sorted_ids[:, 1:] == sorted_ids[:, :-1]
+    ).any(), "HashTopK->TritonKernel conversion requires unique expert IDs per token"
+
+    # Power-of-2 padding for triton-kernels routing kernels.
+    # Both `topk.topk_forward` and `routing_details._routing_compute` require
+    # N_EXPTS_ACT (and `N_EXPTS_ACT * BLOCK_M`) to be powers of 2. V4-Flash
+    # uses num_experts_per_tok=6, which fails both constraints.
+    # Pad to next pow-2 using UNIQUE expert IDs not already in each token's
+    # real top-k, with zero weight. This preserves the bitmatrix histogram /
+    # gate-list invariant (each token gets exactly k_pow2 unique bits set,
+    # and the gate list has exactly k_pow2 entries that match), while
+    # contributing zero to the MoE matmul output (gate_scal=0). Cost is
+    # ~k_pow2/k extra GEMM work.
+    n_expts_act_pow2 = 1 << max(0, n_expts_act - 1).bit_length()
+    if n_expts_act_pow2 != n_expts_act:
+        pad = n_expts_act_pow2 - n_expts_act
+        n_tokens = topk_ids.shape[0]
+        # Find `pad` unused expert IDs per token. Build a [N, n_expts_tot]
+        # mask of used experts, then take the top-`pad` indices of (1 - mask):
+        # values 1 (unused) sort above 0 (used), so torch.topk returns
+        # `pad` distinct unused IDs per row. Identity of the chosen IDs does
+        # not matter — only that they are unused (so bitmatrix has k_pow2
+        # bits set per token) and distinct (so the gate list and bitmatrix
+        # describe the same routing).
+        used = torch.zeros(
+            n_tokens, n_expts_tot, dtype=torch.bool, device=topk_ids.device
+        )
+        used.scatter_(1, topk_ids.long(), True)
+        _, pad_ids = torch.topk((~used).to(torch.int32), k=pad, dim=1)
+        pad_ids = pad_ids.to(topk_ids.dtype)
+        pad_weights = torch.zeros(
+            n_tokens, pad, dtype=topk_weights.dtype, device=topk_weights.device
+        )
+        topk_weights = torch.cat([topk_weights, pad_weights], dim=-1)
+        topk_ids = torch.cat([topk_ids, pad_ids], dim=-1)
+        n_expts_act = n_expts_act_pow2
+
     y_indx_i16 = topk_ids.to(torch.int16)
     _, _, bitmatrix = topk_forward(
         router_logits,
