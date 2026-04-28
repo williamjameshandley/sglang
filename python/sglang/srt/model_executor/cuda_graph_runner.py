@@ -904,6 +904,11 @@ class CudaGraphRunner:
 
         _set_capture_lora_variant(None)
 
+        # Drop the last captured graph-buffer SWA loc slice so it cannot leak
+        # into a subsequent eager forward whose batch has out_cache_loc_swa=None.
+        if hasattr(self.model_runner.token_to_kv_pool, "set_swa_loc"):
+            self.model_runner.token_to_kv_pool.set_swa_loc(None)
+
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)
 

@@ -3056,8 +3056,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 server_args=self.server_args,
             )
 
-        # Use precomputed SWA cache location
-        if forward_batch.out_cache_loc_swa is not None:
+        # Use precomputed SWA cache location. Always set (even to None) so a
+        # previous batch's cached loc cannot leak into this forward; the V4
+        # KV pool falls back to translate_loc_from_full_to_swa when None.
+        if hasattr(self.token_to_kv_pool, "set_swa_loc"):
             self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
         forward_batch.hisparse_coordinator = self.hisparse_coordinator
