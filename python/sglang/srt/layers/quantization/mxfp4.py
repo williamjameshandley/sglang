@@ -152,23 +152,6 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
             "is_persistent": False,
             "block_k": 128,
             "num_stages": 1,
-            # Workaround for a triton_kernels v3.5.1 bug at
-            # `matmul_ogs_details/_matmul_ogs.py:191`:
-            #   offs_x_m = tl.max_contiguous(
-            #       tl.multiple_of(offs_x_m % M, BLOCK_M), BLOCK_M)
-            # The hint claims BLOCK_M-wide contiguity even when M < BLOCK_M
-            # (per-expert hist[e] = number of routed tokens). Triton then
-            # vectorizes the unmasked `tl.load(GatherIndx + offs_x_m)` and
-            # reads past the [N*n_expts_act] gate list when start_m + BLOCK_M
-            # exceeds it. V4-Flash with small batches (M=6) routinely has
-            # hist[e] < default BLOCK_M=16, so the OOB fires every forward.
-            # Upstream main fixed this by padding slice sizes
-            # (X_SLICE_SIZES_DIVISIBILITY) — a substantial refactor we
-            # cannot back-port locally. Forcing BLOCK_M=1 makes the
-            # contiguity hint trivially true and the unmasked load reads
-            # exactly one valid element per lane. Slow but correct;
-            # revisit when sgl-kernel ships a newer triton_kernels.
-            "block_m": 1,
         }
         opt_flags.update_opt_flags_constraints(constraints)
     else:
