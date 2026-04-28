@@ -889,6 +889,17 @@ class DeepSeekV4TokenToKVPool(KVCache):
     # - PagedTokenToKVAllocator
 
 
+def _free_valid(allocator, indices: Optional[torch.Tensor]) -> None:
+    """Free indices on a paged allocator, skipping slot 0 (the reserved
+    padded-output slot per allocator.py:116-119, 452-455). Used for
+    rolling back partial composite allocations."""
+    if indices is None:
+        return
+    valid = indices[indices > 0]
+    if valid.numel() > 0:
+        allocator.free(valid)
+
+
 class DeepSeekV4TokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """V4-aware allocator that owns separate full and SWA paged allocators
     plus the `full_to_swa_index_mapping` consumed by
@@ -1061,8 +1072,11 @@ class DeepSeekV4TokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             swa_last_loc,
             extend_num_tokens,
         )
-        assert alloc_full_indices is not None
-        assert alloc_swa_indices is not None
+
+        if alloc_full_indices is None or alloc_swa_indices is None:
+            _free_valid(self.full_attn_allocator, alloc_full_indices)
+            _free_valid(self.swa_attn_allocator, alloc_swa_indices)
+            return None
 
         self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
         return alloc_full_indices
@@ -1083,6 +1097,8 @@ class DeepSeekV4TokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
         if alloc_full_indices is None or alloc_swa_indices is None:
+            _free_valid(self.full_attn_allocator, alloc_full_indices)
+            _free_valid(self.swa_attn_allocator, alloc_swa_indices)
             return None
 
         self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
@@ -1124,15 +1140,20 @@ class DeepSeekV4TokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         self.free_group = []
 
     def backup_state(self):
+        # full_to_swa_index_mapping is allocator state — speculative rollback
+        # would otherwise leave full↔SWA translation desynced from the inner
+        # free lists. Snapshot it alongside the inner allocator states.
         return [
             self.full_attn_allocator.backup_state(),
             self.swa_attn_allocator.backup_state(),
+            self.full_to_swa_index_mapping.clone(),
         ]
 
     def restore_state(self, state) -> None:
-        assert len(state) == 2
+        assert len(state) == 3
         self.full_attn_allocator.restore_state(state[0])
         self.swa_attn_allocator.restore_state(state[1])
+        self.full_to_swa_index_mapping.copy_(state[2])
 
     def clear(self) -> None:
         self.full_attn_allocator.clear()
