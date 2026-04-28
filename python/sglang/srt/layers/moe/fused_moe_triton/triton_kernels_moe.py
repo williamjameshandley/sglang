@@ -147,12 +147,38 @@ def triton_kernel_fused_experts(
     # confirm. Env-gated to keep noise out of normal runs.
     import os as _os
     if _os.environ.get("SGLANG_PHASE3_TRACE_MOE"):
+        _w1_storage = getattr(w1, "_storage", None) or getattr(w1, "data", None)
+        _w1_dtype = getattr(w1, "dtype", None)
+        _w1_layout = type(getattr(w1, "layout", None)).__name__
+        _pcg_scale = getattr(w1_pcg, "weight_scale", None) if w1_pcg is not None else None
+        _scale_shape = (
+            tuple(_pcg_scale.shape) if _pcg_scale is not None and hasattr(_pcg_scale, "shape") else None
+        )
+        _scale_dtype = getattr(_pcg_scale, "dtype", None) if _pcg_scale is not None else None
+        _hist = routing_data.expt_hist
+        _hist_summary = None
+        if _hist is not None:
+            _hist_summary = {
+                "shape": tuple(_hist.shape),
+                "max": int(_hist.max().item()),
+                "nonzero": int((_hist > 0).sum().item()),
+            }
+        _gate = routing_data.gate_scal
+        _gate_summary = None
+        if _gate is not None:
+            _gate_summary = {
+                "shape": tuple(_gate.shape),
+                "dtype": str(_gate.dtype),
+                "min": float(_gate.min().item()),
+                "max": float(_gate.max().item()),
+                "n_zero": int((_gate == 0).sum().item()),
+            }
         print(
             f"[phase3-moe] M={M} K={K} E={E} N={N} n_expts_act={n_expts_act} "
-            f"routing_data.n_expts_tot={routing_data.n_expts_tot} "
-            f"routing_data.n_expts_act={routing_data.n_expts_act} "
-            f"w1.shape={tuple(w1.shape)} "
-            f"hist.shape={tuple(routing_data.expt_hist.shape) if routing_data.expt_hist is not None else None}",
+            f"n_expts_tot={routing_data.n_expts_tot} "
+            f"w1.shape={tuple(w1.shape)} w1.dtype={_w1_dtype} w1.layout={_w1_layout} "
+            f"scale.shape={_scale_shape} scale.dtype={_scale_dtype} "
+            f"hist={_hist_summary} gate={_gate_summary}",
             flush=True,
         )
 
