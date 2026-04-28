@@ -264,6 +264,29 @@ def to_triton_kernels_format(
     # consistently.
     topk_weights = topk_weights.to(torch.float32)
 
+    # Empty-batch guard: min/max raise on zero-element tensors. Build an
+    # empty TritonKernelTopKOutput-equivalent directly without invoking
+    # the Triton kernel (which has its own zero-row handling but we'd
+    # still need valid metadata).
+    if topk_ids.numel() == 0:
+        empty_indx = torch.empty(0, dtype=torch.int32, device=topk_ids.device)
+        ragged_meta = make_ragged_tensor_metadata(
+            torch.zeros(n_expts_tot, dtype=torch.int32, device=topk_ids.device),
+            0,
+        )
+        routing_data = RoutingData(
+            gate_scal=topk_weights.reshape(-1),
+            expt_hist=ragged_meta.slice_sizes,
+            n_expts_tot=n_expts_tot,
+            n_expts_act=n_expts_act,
+            expt_data=ragged_meta,
+        )
+        return TritonKernelTopKOutput(
+            routing_data,
+            GatherIndx(empty_indx, empty_indx),
+            ScatterIndx(empty_indx, empty_indx),
+        )
+
     assert (
         topk_ids.min().item() >= 0
     ), "to_triton_kernels_format requires topk_ids >= 0 (no -1 padded sentinels)"
@@ -293,8 +316,15 @@ def to_triton_kernels_format(
     ragged_meta = make_ragged_tensor_metadata(
         sparse.mask_metadata.col_sum, dispatch_indx.shape[0]
     )
+    # gate_scal must be in expert-sorted order (matmul_ogs reads
+    # `gammas[lo:hi]` per-expert without going through gather_indx).
+    # `topk_weights.reshape(-1)` is token-major; reorder via
+    # combine_indx (the same row_sorted -> col_sorted mapping
+    # GatherIndx uses).
+    flat_gate = topk_weights.reshape(-1)
+    gate_scal = flat_gate[combine_indx.to(torch.long)].contiguous()
     routing_data = RoutingData(
-        gate_scal=topk_weights.flatten(),
+        gate_scal=gate_scal,
         expt_hist=ragged_meta.slice_sizes,
         n_expts_tot=n_expts_tot,
         n_expts_act=n_expts_act,
@@ -426,6 +456,15 @@ class TopK(MultiPlatformOp):
                 "TRITON_KERNEL TopK does not support "
                 "num_fused_shared_experts > 0 "
                 "(IDs >= router_logits.shape[-1] would index out of range)"
+            )
+            # `select_experts` writes -1 into `topk_ids` for padded-region
+            # rows; `to_triton_kernels_format` cannot consume those. Reject
+            # the masked-padding case explicitly until the v3.6.0 `n_rows`
+            # path is plumbed through.
+            assert num_token_non_padded is None, (
+                "TRITON_KERNEL TopK does not currently support padded-region "
+                "masking; -1 expert IDs would be rejected by "
+                "to_triton_kernels_format"
             )
 
             self.topk_config.torch_native = False
