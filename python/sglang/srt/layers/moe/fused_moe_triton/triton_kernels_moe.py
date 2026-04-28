@@ -13,7 +13,9 @@ from triton_kernels.matmul_ogs import (
     matmul_ogs,
 )
 from triton_kernels.numerics import InFlexData
-from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
+# triton_kernels v3.6.0 moved these classes from the dropped `routing`
+# submodule into `matmul_ogs`.
+from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
 from triton_kernels.swiglu import swiglu_fn
 
 from sglang.srt.utils import is_cuda

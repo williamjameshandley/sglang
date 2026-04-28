@@ -32,7 +32,18 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
+    # triton_kernels v3.6.0 moved RoutingData/GatherIndx/ScatterIndx from
+    # the dropped `routing` submodule into `matmul_ogs`, replaced
+    # `routing_from_bitmatrix` with constructing RoutingData via
+    # `make_ragged_tensor_metadata` over a `SparseMatrix.mask_metadata`,
+    # and replaced the pow-2-only `tl.arange(0, N_EXPTS_ACT)` with the
+    # native `tl.topk` so non-pow-2 top-k values work without padding.
+    from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
+    from triton_kernels.tensor import (
+        SparseMatrix,
+        make_ragged_tensor_metadata,
+    )
+    from triton_kernels.topk import topk as _triton_kernels_topk
 except ImportError:
     pass
 
@@ -230,92 +241,67 @@ def to_triton_kernels_format(
 ) -> "TritonKernelTopKOutput":
     """Build a TritonKernelTopKOutput from already-postprocessed topk_weights/ids.
 
-    Re-uses the caller's `topk_ids` to derive the bitmatrix, and threads
-    the caller's `topk_weights` through `routing_from_bitmatrix` so they
-    survive into `RoutingData.gate_scal`. We do NOT call
-    `routing(router_logits, expt_indx=topk_ids)` because that path
-    re-derives weights from selected-logit softmax, discarding the
-    caller's scoring/normalization.
+    Uses triton_kernels v3.6.0's native `topk` (which handles arbitrary
+    non-pow-2 k via `tl.topk` rather than v3.5.1's `tl.arange(0, k)`-bound
+    pattern) to compute the SparseMatrix and bitmatrix metadata, then
+    constructs RoutingData / GatherIndx / ScatterIndx in the canonical
+    way described in `triton_kernels/tests/test_matmul.py:init_routing_data`.
 
-    Pads `n_expts_act` to the next power of 2 by appending unique unused
-    expert IDs with zero weight. The triton-kernels routing kernels
-    require pow-2 N_EXPTS_ACT in `tl.arange(0, N_EXPTS_ACT)` and
-    `tl.arange(0, N_EXPTS_ACT * BLOCK_M)`; padding preserves the
-    bitmatrix-histogram / gate-list invariant (k_pow2 unique bits per
-    token, N*k_pow2 gate entries pointing to those experts).
-
-    Used for V4-Flash whose `num_experts_per_tok=6` is not pow-2, by both
-    HashTopK (hash-routed layers) and TopK (canonical layers).
+    Re-uses the caller's `topk_ids` (via `y_indx`) so V4-Flash's noaux_tc /
+    biased_grouped_topk scoring is preserved through to RoutingData; the
+    caller's `topk_weights` are threaded into `RoutingData.gate_scal`
+    directly so they survive into the matmul as gate scalars rather than
+    being re-derived from softmax over selected logits.
 
     Caller contract: `topk_ids` must be already postprocessed (any
     `_mask_topk_ids_padded_region` and `topk_ids_logical_to_physical`
     applied), with all IDs in `[0, n_expts_tot)` and unique per row.
     Sentinel `-1` and out-of-range IDs are rejected.
     """
-    from triton_kernels.routing import routing_from_bitmatrix
-    from triton_kernels.topk import topk_forward
-
-    # routing_from_bitmatrix's gate_scal output is whatever dtype we hand
-    # in; the canonical select_experts contract is fp32. Cast defensively
-    # so both HashTopK (whose forward leaves dtype dependent on the score
-    # function) and TopK (already fp32) end up with fp32 RoutingData.
+    # The canonical select_experts contract returns fp32 gate scalars; cast
+    # defensively so both HashTopK (whose forward leaves dtype dependent
+    # on the score function) and TopK (already fp32) reach RoutingData
+    # consistently.
     topk_weights = topk_weights.to(torch.float32)
 
-    # No -1 padded-region sentinels: cast to int16 in topk_forward would
-    # send -1 to 0xFFFF and contaminate the bitmatrix.
     assert (
         topk_ids.min().item() >= 0
     ), "to_triton_kernels_format requires topk_ids >= 0 (no -1 padded sentinels)"
-    # IDs must index a real router_logits column; out-of-range would gather
-    # garbage and corrupt the bitmatrix histogram.
     assert (
         topk_ids.max().item() < n_expts_tot
     ), f"to_triton_kernels_format requires topk_ids < {n_expts_tot}"
-    # Per-token uniqueness: the bitmatrix records (token, expert) as binary;
-    # duplicates would shrink the histogram below the gate-list count and
-    # corrupt routing offsets.
     sorted_ids, _ = topk_ids.sort(dim=1)
     assert not (
         sorted_ids[:, 1:] == sorted_ids[:, :-1]
     ).any(), "to_triton_kernels_format requires unique expert IDs per token"
 
-    n_expts_act_pow2 = 1 << max(0, n_expts_act - 1).bit_length()
-    if n_expts_act_pow2 != n_expts_act:
-        pad = n_expts_act_pow2 - n_expts_act
-        n_tokens = topk_ids.shape[0]
-        # Find `pad` unused expert IDs per token via topk on (~used) mask;
-        # values 1 (unused) sort above 0 (used), so torch.topk yields
-        # `pad` distinct unused IDs per row. Identity does not matter, only
-        # that they are unused (so bitmatrix has k_pow2 bits set per token)
-        # and distinct (so gate list and bitmatrix describe the same
-        # routing).
-        used = torch.zeros(
-            n_tokens, n_expts_tot, dtype=torch.bool, device=topk_ids.device
-        )
-        used.scatter_(1, topk_ids.long(), True)
-        _, pad_ids = torch.topk((~used).to(torch.int32), k=pad, dim=1)
-        pad_ids = pad_ids.to(topk_ids.dtype)
-        pad_weights = torch.zeros(
-            n_tokens, pad, dtype=topk_weights.dtype, device=topk_weights.device
-        )
-        topk_weights = torch.cat([topk_weights, pad_weights], dim=-1)
-        topk_ids = torch.cat([topk_ids, pad_ids], dim=-1)
-        n_expts_act = n_expts_act_pow2
-
-    y_indx_i16 = topk_ids.to(torch.int16)
-    _, _, bitmatrix = topk_forward(
+    # Run v3.6.0 topk with caller-provided indices so the bitmatrix and
+    # mask_metadata reflect the caller's choice (and not a re-selection).
+    sparse = _triton_kernels_topk(
         router_logits,
         n_expts_act,
         apply_softmax=False,
-        y_indx=y_indx_i16,
+        y_indx=topk_ids,
     )
-    routing_data, gather_idx, scatter_idx = routing_from_bitmatrix(
-        bitmatrix,
-        topk_weights,
-        y_indx_i16,
-        n_expts_tot,
-        n_expts_act,
+    # SparseMatrix.vals from `_topk` would be the gathered raw logits;
+    # we need our caller's actual weights. Construct a fresh SparseMatrix
+    # over the same mask so __post_init__ rebuilds mask_metadata with our
+    # vals.
+    sparse = SparseMatrix(vals=topk_weights, indx=topk_ids, mask=sparse.mask)
+    dispatch_indx = sparse.mask_metadata.row_sorted_indx
+    combine_indx = sparse.mask_metadata.col_sorted_indx
+    ragged_meta = make_ragged_tensor_metadata(
+        sparse.mask_metadata.col_sum, dispatch_indx.shape[0]
     )
+    routing_data = RoutingData(
+        gate_scal=topk_weights.flatten(),
+        expt_hist=ragged_meta.slice_sizes,
+        n_expts_tot=n_expts_tot,
+        n_expts_act=n_expts_act,
+        expt_data=ragged_meta,
+    )
+    gather_idx = GatherIndx(combine_indx, dispatch_indx)
+    scatter_idx = ScatterIndx(dispatch_indx, combine_indx)
     return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
 
 
@@ -427,30 +413,17 @@ class TopK(MultiPlatformOp):
             output_format = TopKOutputFormat.STANDARD
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
-            top_k = self.topk_config.top_k
-            n_expts_act_pow2 = 1 << max(0, top_k - 1).bit_length()
-            if n_expts_act_pow2 == top_k:
-                # renormalize=True is equivalent to sm_first=False
-                routing_data, gather_idx, scatter_idx = routing(
-                    router_logits,
-                    top_k,
-                    sm_first=not self.topk_config.renormalize,
-                )
-                return TritonKernelTopKOutput(
-                    routing_data, gather_idx, scatter_idx
-                )
-            # Non-pow-2 top-k (e.g. V4-Flash's 6): triton-kernels routing
-            # internally calls `tl.arange(0, N_EXPTS_ACT)` which requires
-            # pow-2. Delegate to `select_experts` (which honors the full
-            # TopKConfig — noaux_tc, biased_grouped_topk, EPLB remap, padded
-            # masking, etc.) and convert its StandardTopKOutput via the
-            # shared padding helper so the kernel sees pow-2 N_EXPTS_ACT
-            # while the gate list keeps the real top-k entries.
+            # triton_kernels v3.6.0's `topk` handles arbitrary (non-pow-2)
+            # k natively, so the v3.5.1 pow-2 fast path is no longer
+            # needed. We always delegate to `select_experts` (which honors
+            # the full TopKConfig — noaux_tc, biased_grouped_topk, EPLB
+            # remap, padded masking, etc.) and convert its
+            # StandardTopKOutput to a TritonKernelTopKOutput.
             #
-            # The to_triton_kernels_format helper cannot represent fused
-            # shared expert IDs >= n_routed_experts, so guard that here.
+            # to_triton_kernels_format cannot represent fused shared
+            # expert IDs >= n_routed_experts; guard that here.
             assert self.topk_config.num_fused_shared_experts == 0, (
-                "Non-pow-2 TRITON_KERNEL TopK fallback does not support "
+                "TRITON_KERNEL TopK does not support "
                 "num_fused_shared_experts > 0 "
                 "(IDs >= router_logits.shape[-1] would index out of range)"
             )
@@ -467,9 +440,6 @@ class TopK(MultiPlatformOp):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
-            # `select_experts` returns gate scalars in float32 by contract;
-            # cast defensively in case a non-CUDA path delivered another
-            # dtype.
             return to_triton_kernels_format(
                 topk_weights=std.topk_weights.to(torch.float32),
                 topk_ids=std.topk_ids.to(torch.int32),

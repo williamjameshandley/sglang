@@ -20,7 +20,9 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 
 if TYPE_CHECKING:
     from triton_kernels.matmul_ogs import PrecisionConfig
-    from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx
+    # triton_kernels v3.6.0 moved these classes from the dropped
+    # `routing` submodule into `matmul_ogs`.
+    from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
 
     from sglang.srt.layers.moe.token_dispatcher.standard import (
         StandardCombineInput,
