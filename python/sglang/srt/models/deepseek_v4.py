@@ -370,17 +370,6 @@ class Compressor(nn.Module):
             pre_state_indices = self.compute_state_len_indices(
                 seq_len=prefix_lens[i], ratio=self.ratio
             ).to(device)
-            # Phase3 OOB diagnostic — env-gated so it doesn't pollute logs.
-            if os.environ.get("SGLANG_PHASE3_TRACE_COMPRESS"):
-                print(
-                    f"[phase3-trace] compress_extend_paged i={i} "
-                    f"prefix_lens[i]={prefix_lens[i]} "
-                    f"req_pool_indices[i]={req_pool_indices[i].item() if torch.is_tensor(req_pool_indices[i]) else req_pool_indices[i]} "
-                    f"req_to_token.shape={req_to_token.shape} "
-                    f"pre_state_indices={pre_state_indices.tolist()} "
-                    f"ratio={self.ratio}",
-                    flush=True,
-                )
             raw_loc = torch.where(
                 pre_state_indices < 0,
                 -1,
