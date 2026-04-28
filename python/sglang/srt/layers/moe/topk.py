@@ -596,6 +596,10 @@ class TopK(MultiPlatformOp):
                 "TopK.empty_topk_output under triton_kernels backend "
                 "requires num_experts to be set on TopKConfig"
             )
+            assert self.topk_config.num_fused_shared_experts == 0, (
+                "TRITON_KERNEL TopK does not support "
+                "num_fused_shared_experts > 0"
+            )
             return empty_triton_kernels_topk_output(
                 n_expts_tot=self.topk_config.num_experts,
                 n_expts_act=topk,

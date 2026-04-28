@@ -71,6 +71,10 @@ class HashTopK(nn.Module):
     def empty_topk_output(self, device: torch.device):
         topk = self.topk - self.num_fused_shared_experts
         if get_moe_runner_backend().is_triton_kernels():
+            assert self.num_fused_shared_experts == 0, (
+                "HashTopK->TritonKernel conversion does not support "
+                "fused shared experts"
+            )
             return empty_triton_kernels_topk_output(
                 n_expts_tot=self.num_experts, n_expts_act=topk, device=device
             )
