@@ -298,6 +298,30 @@ def to_triton_kernels_format(
         sorted_ids[:, 1:] == sorted_ids[:, :-1]
     ).any(), "to_triton_kernels_format requires unique expert IDs per token"
 
+    # Power-of-2 padding still required in v3.6.0: the upstream `tl.topk`
+    # replacement only covered `streaming_topk`'s search loop, but
+    # `_topk_forward.py:114` still has `offs_y_n = tl.arange(0, N_EXPTS_ACT)`
+    # which keeps the pow-2 constraint. We pad to next pow-2 with unique
+    # unused expert IDs (zero weight) so the bitmatrix/gate-list invariant
+    # holds: each token gets k_pow2 unique bits set; gate list has N*k_pow2
+    # entries; padded entries contribute zero to the matmul output.
+    n_expts_act_pow2 = 1 << max(0, n_expts_act - 1).bit_length()
+    if n_expts_act_pow2 != n_expts_act:
+        pad = n_expts_act_pow2 - n_expts_act
+        n_tokens = topk_ids.shape[0]
+        used = torch.zeros(
+            n_tokens, n_expts_tot, dtype=torch.bool, device=topk_ids.device
+        )
+        used.scatter_(1, topk_ids.long(), True)
+        _, pad_ids = torch.topk((~used).to(torch.int32), k=pad, dim=1)
+        pad_ids = pad_ids.to(topk_ids.dtype)
+        pad_weights = torch.zeros(
+            n_tokens, pad, dtype=topk_weights.dtype, device=topk_weights.device
+        )
+        topk_weights = torch.cat([topk_weights, pad_weights], dim=-1)
+        topk_ids = torch.cat([topk_ids, pad_ids], dim=-1)
+        n_expts_act = n_expts_act_pow2
+
     # Run v3.6.0 topk with caller-provided indices so the bitmatrix and
     # mask_metadata reflect the caller's choice (and not a re-selection).
     sparse = _triton_kernels_topk(
