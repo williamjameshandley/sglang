@@ -888,26 +888,28 @@ class CudaGraphRunner:
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
         # can reuse the memory pool allocated for the large shapes.
-        with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
-            if not self.enable_pdmux:
-                with graph_capture() as graph_capture_context, profile_context as prof:
-                    self.stream = graph_capture_context.stream
-                    _capture_one_stream()
-            else:
-                set_pdmux_status(False)
-                for i, sg in enumerate(self.stream_groups):
-                    with graph_capture(
-                        stream=sg[1]
-                    ) as graph_capture_context, profile_context as prof:
+        try:
+            with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
+                if not self.enable_pdmux:
+                    with graph_capture() as graph_capture_context, profile_context as prof:
                         self.stream = graph_capture_context.stream
-                        _capture_one_stream(i)
-
-        _set_capture_lora_variant(None)
-
-        # Drop the last captured graph-buffer SWA loc slice so it cannot leak
-        # into a subsequent eager forward whose batch has out_cache_loc_swa=None.
-        if hasattr(self.model_runner.token_to_kv_pool, "set_swa_loc"):
-            self.model_runner.token_to_kv_pool.set_swa_loc(None)
+                        _capture_one_stream()
+                else:
+                    set_pdmux_status(False)
+                    for i, sg in enumerate(self.stream_groups):
+                        with graph_capture(
+                            stream=sg[1]
+                        ) as graph_capture_context, profile_context as prof:
+                            self.stream = graph_capture_context.stream
+                            _capture_one_stream(i)
+        finally:
+            _set_capture_lora_variant(None)
+            # Drop the last captured graph-buffer SWA loc slice so it cannot
+            # leak into a subsequent eager forward whose batch has
+            # out_cache_loc_swa=None. Run on capture failure too so a partial
+            # capture leaves no poisoned pool state.
+            if hasattr(self.model_runner.token_to_kv_pool, "set_swa_loc"):
+                self.model_runner.token_to_kv_pool.set_swa_loc(None)
 
         if self.enable_profile_cuda_graph:
             self._post_process_after_profile(prof)

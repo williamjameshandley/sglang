@@ -539,8 +539,14 @@ class DeepSeekV4TokenToKVPool(KVCache):
         Called by model_runner._forward_raw (eager) and
         cuda_graph_runner.capture_one_batch_size with
         forward_batch.out_cache_loc_swa, which is already SWA-space.
+
+        When loc is None, also drop the per-batch fused cache: that cache
+        is only refreshed at layer_id == 0, so a later layer with stale
+        cached_loc would write SWA KV to wrong slots.
         """
         self.swa_loc = loc
+        if loc is None:
+            self.cached_loc = None
 
     def get_ring_size(self, compress_ratio: int) -> int:
         server_args = get_global_server_args()
@@ -845,7 +851,11 @@ class DeepSeekV4TokenToKVPool(KVCache):
         if self.swa_loc is not None:
             swa_loc = self.swa_loc
         elif self._should_cache_swa:
-            if layer_id == 0:
+            # Refresh the cache on the first SWA write of a forward — either
+            # the canonical "first layer is layer 0" case, or PP ranks whose
+            # first local layer is non-zero (set_swa_loc(None) clears
+            # cached_loc each batch, so a None means a fresh forward).
+            if layer_id == 0 or self.cached_loc is None:
                 self.cached_loc = self.translate_loc_from_full_to_swa(raw_loc)
             swa_loc = self.cached_loc
         else:
