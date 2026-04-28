@@ -874,6 +874,15 @@ class FusedMoE(torch.nn.Module):
 
         # Case weight scales and zero_points
         if "scale" in weight_name or "zero" in weight_name or "offset" in weight_name:
+            # MXFP4 group scales arrive as float8_e8m0fnu but are stored as
+            # uint8 (raw exponent bytes). A direct .copy_() would numerically
+            # saturate each byte (e.g. byte 250 = 2**123 → clipped to 255 or
+            # 0), corrupting the scale. Reinterpret the bytes instead.
+            if (
+                expert_data.dtype == torch.uint8
+                and loaded_weight.dtype == torch.float8_e8m0fnu
+            ):
+                loaded_weight = loaded_weight.view(torch.uint8)
             # load the weight scales and zp based on the quantization scheme
             # supported weight scales/zp can be found in
             # FusedMoeWeightScaleSupported
