@@ -35,6 +35,7 @@ from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TritonKernelTopKOutput,
     _mask_topk_ids_padded_region,
+    empty_triton_kernels_topk_output,
     to_triton_kernels_format,
 )
 
@@ -69,9 +70,15 @@ class HashTopK(nn.Module):
 
     def empty_topk_output(self, device: torch.device):
         topk = self.topk - self.num_fused_shared_experts
+        if get_moe_runner_backend().is_triton_kernels():
+            return empty_triton_kernels_topk_output(
+                n_expts_tot=self.num_experts, n_expts_act=topk, device=device
+            )
         topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
-        router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
+        router_logits = torch.empty(
+            (0, self.num_experts), dtype=torch.float32, device=device
+        )
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
     def _forward_torch(

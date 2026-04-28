@@ -494,6 +494,7 @@ class DeepseekV2MoE(nn.Module):
                 use_grouped_topk=True,
                 num_expert_group=config.n_group,
                 num_fused_shared_experts=self.num_fused_shared_experts,
+                num_experts=config.n_routed_experts,
                 topk_group=config.topk_group,
                 correction_bias=self.gate.e_score_correction_bias,
                 quant_config=quant_config,

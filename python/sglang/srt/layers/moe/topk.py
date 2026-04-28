@@ -170,6 +170,10 @@ class TopKConfig:
     fused_shared_experts_scaling_factor: Optional[float] = None
     output_format: Optional[TopKOutputFormat] = None
     scoring_func: str = "softmax"
+    # Number of routing columns (n_routed_experts). Used by
+    # empty_topk_output to construct a correctly-shaped router_logits and
+    # to size RoutingData.n_expts_tot for the triton_kernels backend.
+    num_experts: Optional[int] = None
 
 
 # -------------------------------- TopKOutput ---------------------------------------
@@ -232,6 +236,34 @@ class TritonKernelTopKOutput(NamedTuple):
         return TopKOutputFormat.TRITON_KERNEL
 
 
+def empty_triton_kernels_topk_output(
+    n_expts_tot: int, n_expts_act: int, device: torch.device
+) -> "TritonKernelTopKOutput":
+    """Build a zero-row TritonKernelTopKOutput. Used by TopK / HashTopK
+    `empty_topk_output` when the moe runner is triton_kernels — the
+    runner's pre-permute asserts the format, and `StandardTopKOutput`
+    would crash. Pads `n_expts_act` to next power of 2 because
+    `RoutingData.n_expts_act` is later consumed by matmul_ogs metadata
+    even with zero rows."""
+    n_expts_act_pow2 = 1 << max(0, n_expts_act - 1).bit_length()
+    empty_indx = torch.empty(0, dtype=torch.int32, device=device)
+    ragged_meta = make_ragged_tensor_metadata(
+        torch.zeros(n_expts_tot, dtype=torch.int32, device=device), 0
+    )
+    routing_data = RoutingData(
+        gate_scal=torch.empty(0, dtype=torch.float32, device=device),
+        expt_hist=ragged_meta.slice_sizes,
+        n_expts_tot=n_expts_tot,
+        n_expts_act=n_expts_act_pow2,
+        expt_data=ragged_meta,
+    )
+    return TritonKernelTopKOutput(
+        routing_data,
+        GatherIndx(empty_indx, empty_indx),
+        ScatterIndx(empty_indx, empty_indx),
+    )
+
+
 def to_triton_kernels_format(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -265,26 +297,11 @@ def to_triton_kernels_format(
     topk_weights = topk_weights.to(torch.float32)
 
     # Empty-batch guard: min/max raise on zero-element tensors. Build an
-    # empty TritonKernelTopKOutput-equivalent directly without invoking
-    # the Triton kernel (which has its own zero-row handling but we'd
-    # still need valid metadata).
+    # empty TritonKernelTopKOutput directly without invoking the Triton
+    # kernel; the helper applies pow-2 padding to n_expts_act.
     if topk_ids.numel() == 0:
-        empty_indx = torch.empty(0, dtype=torch.int32, device=topk_ids.device)
-        ragged_meta = make_ragged_tensor_metadata(
-            torch.zeros(n_expts_tot, dtype=torch.int32, device=topk_ids.device),
-            0,
-        )
-        routing_data = RoutingData(
-            gate_scal=topk_weights.reshape(-1),
-            expt_hist=ragged_meta.slice_sizes,
-            n_expts_tot=n_expts_tot,
-            n_expts_act=n_expts_act,
-            expt_data=ragged_meta,
-        )
-        return TritonKernelTopKOutput(
-            routing_data,
-            GatherIndx(empty_indx, empty_indx),
-            ScatterIndx(empty_indx, empty_indx),
+        return empty_triton_kernels_topk_output(
+            n_expts_tot, n_expts_act, topk_ids.device
         )
 
     assert (
@@ -403,6 +420,7 @@ class TopK(MultiPlatformOp):
         apply_routed_scaling_factor_on_output: Optional[bool] = False,
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
+        num_experts: Optional[int] = None,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -426,6 +444,7 @@ class TopK(MultiPlatformOp):
             fused_shared_experts_scaling_factor=fused_shared_experts_scaling_factor,
             output_format=output_format,
             scoring_func=scoring_func,
+            num_experts=num_experts,
         )
 
     def forward_native(
@@ -572,13 +591,25 @@ class TopK(MultiPlatformOp):
 
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
+        if get_moe_runner_backend().is_triton_kernels():
+            assert self.topk_config.num_experts is not None, (
+                "TopK.empty_topk_output under triton_kernels backend "
+                "requires num_experts to be set on TopKConfig"
+            )
+            return empty_triton_kernels_topk_output(
+                n_expts_tot=self.topk_config.num_experts,
+                n_expts_act=topk,
+                device=device,
+            )
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
             topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
-        # FIXME: router_logits should be of size (0, num_experts)
-        router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
+        num_experts = self.topk_config.num_experts or topk
+        router_logits = torch.empty(
+            (0, num_experts), dtype=torch.float32, device=device
+        )
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
