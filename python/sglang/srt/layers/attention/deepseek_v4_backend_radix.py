@@ -128,6 +128,18 @@ def _copy_metadata(
 
 
 def _create_flashmla_metadata():
+    # Phase 6.3: skip the import + allocation on devices that won't dispatch
+    # to FlashMLA. On sm_120 (and any other device without an explicit
+    # FLASH_MLA / COMPARISON override), per-call dispatch never consumes
+    # this metadata — building it would just hard-import a library with no
+    # compatible kernels.
+    from sglang.srt.layers.attention.sparse_mla_backend import (
+        need_flashmla_metadata,
+    )
+
+    if not need_flashmla_metadata():
+        return None
+
     import flash_mla
 
     return flash_mla.get_mla_metadata()[0]
@@ -1088,7 +1100,10 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 extra_topk_length=extra_topk_lengths,
             )
 
-            backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
+            from sglang.srt.layers.attention.sparse_mla_backend import (
+                get_sparse_mla_decode_backend,
+            )
+            backend = get_sparse_mla_decode_backend(**input_dict)
             o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
 
             o = o.squeeze(1)

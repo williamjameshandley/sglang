@@ -83,13 +83,19 @@ def copy_metadata(
 
 
 def create_flashmla_metadata():
-    # if is_hip():
-    if os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND") == "torch" or is_hip():
-        return None
-    else:
-        import flash_mla
+    # Phase 6.3: replaced env-var-string check with the per-call backend
+    # selector's `need_flashmla_metadata()` predicate so HIP, sm_120, and
+    # any explicit non-FlashMLA backend share a single source of truth.
+    from sglang.srt.layers.attention.sparse_mla_backend import (
+        need_flashmla_metadata,
+    )
 
-        return flash_mla.get_mla_metadata()[0]
+    if not need_flashmla_metadata():
+        return None
+
+    import flash_mla
+
+    return flash_mla.get_mla_metadata()[0]
 
 
 @dataclass

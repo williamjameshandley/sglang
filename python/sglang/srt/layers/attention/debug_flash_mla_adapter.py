@@ -1,57 +1,75 @@
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import torch
 
+from sglang.srt.layers.attention.sparse_mla_backend import (
+    SparseMLADecodeBackend,
+    parse_backend_string,
+)
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_hip
 
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 
-def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
-    if is_hip():
-        # backend == "torch"
-        import os
+def flash_mla_with_kvcache_entrypoint(
+    backend: Union[SparseMLADecodeBackend, str],
+    **kwargs,
+):
+    """Dispatch a sparse-MLA decode call to the chosen backend.
 
+    `backend` accepts either the new `SparseMLADecodeBackend` enum
+    (preferred; emitted by `get_sparse_mla_decode_backend`) or a legacy
+    string (`torch` / `tilelang` / `comparison` / `kernel` /
+    `triton_sm120`). All imports are scoped per-branch so unused backends
+    don't drag in heavy dependencies (e.g. `flash_mla` on sm_120, where
+    the upstream library has no compatible kernels).
+    """
+    if isinstance(backend, str):
+        backend = parse_backend_string(backend)
+
+    if backend is SparseMLADecodeBackend.TORCH:
+        return flash_mla_with_kvcache_torch(**kwargs)
+
+    if backend is SparseMLADecodeBackend.TRITON_SM120:
+        from sglang.jit_kernel.deepseek_v4 import (
+            flash_mla_with_kvcache_triton_sm120,
+        )
+        return flash_mla_with_kvcache_triton_sm120(**kwargs)
+
+    if backend is SparseMLADecodeBackend.TILELANG:
         from sglang.srt.layers.attention.nsa.tilelang_kernel import (
             dpsk_v4_bf16_sparse_attention_fwd,
         )
-
-        backend = os.environ.get("SGLANG_HACK_FLASHMLA_BACKEND", "kernel")
-    else:
-        import flash_mla
-
-    if backend == "comparison":
-        pack_ref, pack_fast_via_tester = flash_mla_with_kvcache_entrypoint(
-            backend="torch", **kwargs
-        )
-        pack_fast_via_api = flash_mla_with_kvcache_entrypoint(
-            backend="kernel", **kwargs
-        )
-        _assert_close(pack_ref=pack_fast_via_tester, pack_fast=pack_fast_via_api)
-        _assert_close(pack_ref=pack_ref, pack_fast=pack_fast_via_tester)
-        _assert_close(pack_ref=pack_ref, pack_fast=pack_fast_via_api)
-        return pack_ref
-
-    if backend == "torch":
-        return flash_mla_with_kvcache_torch(**kwargs)
-
-    if backend == "tilelang":
         return dpsk_v4_bf16_sparse_attention_fwd(**kwargs)
 
-    if backend == "kernel":
+    if backend is SparseMLADecodeBackend.FLASH_MLA:
+        import flash_mla
         return flash_mla.flash_mla_with_kvcache(**kwargs)
 
-    raise NotImplementedError
+    if backend is SparseMLADecodeBackend.COMPARISON:
+        if kwargs.get("attn_sink") is not None:
+            raise NotImplementedError(
+                "COMPARISON backend disabled when attn_sink is non-None: the "
+                "torch adapter returns plain logsumexp while FlashMLA returns "
+                "sink-included LSE; the comparison would diverge legitimately."
+            )
+        import flash_mla
+        pack_ref = flash_mla_with_kvcache_torch(**kwargs)
+        pack_fast = flash_mla.flash_mla_with_kvcache(**kwargs)
+        _assert_close(pack_ref=pack_ref, pack_fast=pack_fast)
+        return pack_ref
+
+    raise NotImplementedError(f"unhandled sparse-MLA backend: {backend}")
 
 
 def flash_mla_with_kvcache_torch(
     q: torch.Tensor,
     k_cache: torch.Tensor,
-    block_table: Optional[torch.Tensor],
-    cache_seqlens: Optional[torch.Tensor],
-    head_dim_v: int,
-    tile_scheduler_metadata: Any,
+    block_table: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[torch.Tensor] = None,
+    head_dim_v: int = 512,
+    tile_scheduler_metadata: Any = None,
     num_splits: None = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -99,7 +117,6 @@ def flash_mla_with_kvcache_torch(
             extra_block_size="unused",
             have_extra_topk_length="unused",
         ),
-        # unused?
         seed=-1,
         check_correctness=True,
         is_all_indices_invalid=False,
@@ -112,8 +129,6 @@ def flash_mla_with_kvcache_torch(
     blocked_k = flashmla_quant.dequantize_k_cache(
         blocked_k_quantized.view(FP8_DTYPE), fp8_layout
     )
-    # blocked_k_requantized = flashmla_quant.quantize_k_cache(blocked_k, fp8_layout)
-    # assert torch.testing.assert_allclose(blocked_k_requantized.byte(), blocked_k_quantized.byte())
     kv_scope = KVScope(
         t="unused",
         cache_seqlens="unused",
@@ -131,8 +146,6 @@ def flash_mla_with_kvcache_torch(
         extra_blocked_k = flashmla_quant.dequantize_k_cache(
             extra_blocked_k_quantized.view(FP8_DTYPE), fp8_layout
         )
-        # extra_blocked_k_requantized = flashmla_quant.quantize_k_cache(extra_blocked_k, fp8_layout)
-        # assert torch.testing.assert_allclose(extra_blocked_k_requantized.byte(), extra_blocked_k_quantized.byte())
         extra_kv_scope = KVScope(
             t="unused",
             cache_seqlens="unused",
@@ -152,23 +165,8 @@ def flash_mla_with_kvcache_torch(
         kv_scope=kv_scope,
         extra_kv_scope=extra_kv_scope,
     )
-    # print(f"hi {p=} {t=}")
-    # print(
-    #     f"hi info "
-    #     f"{get_tensor_info(t.kv_scope.blocked_k)=} "
-    #     f"{get_tensor_info(t.kv_scope.blocked_k_quantized)=} "
-    #     f"{get_tensor_info(t.extra_kv_scope.blocked_k) if t.extra_kv_scope is not None else None=} "
-    #     f"{get_tensor_info(t.extra_kv_scope.blocked_k_quantized) if t.extra_kv_scope is not None else None=} "
-    # )
 
     pack_ref = ref_sparse_attn_decode(p, t)
-
-    # tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
-    # pack_fast_via_tester = flashmla_lib.run_flash_mla_decode(
-    #     p, t, tile_scheduler_metadata, num_splits=None
-    # )
-
-    # return pack_ref, pack_fast_via_tester
     return pack_ref
 
 
@@ -178,16 +176,6 @@ def _assert_close(pack_ref, pack_fast):
     out_ref, lse_ref = pack_ref
     out_fast, lse_fast = pack_fast
 
-    # the copied threshold is too strict, not checked why
-    # copied from: test_flash_mla_sparse_decoding.py
-    # is_out_correct = kk.check_is_allclose(
-    #     "out", out_fast, out_ref, abs_tol=1e-3, rel_tol=2.01 / 128, cos_diff_tol=5e-6
-    # )
-    # is_lse_correct = kk.check_is_allclose(
-    #     "lse", lse_fast, lse_ref, abs_tol=1e-6, rel_tol=8.01 / 65536
-    # )
-
-    # loosen thresh
     is_out_correct = kk.check_is_allclose(
         "out", out_fast, out_ref, abs_tol=1e-2, rel_tol=10.0, cos_diff_tol=5e-6
     )

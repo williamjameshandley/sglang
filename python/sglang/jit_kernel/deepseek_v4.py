@@ -1016,5 +1016,384 @@ def fp8_paged_mqa_logits_triton(
     return scores
 
 
+# ---------------------------------------------------------------------------
+# Sparse MLA decode — Triton kernel for sm_120 (Phase 6.2)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _sparse_mla_decode_kernel(
+    Q_ptr,            # [B, 1, h_q, 512] bf16
+    KV_FP8_ptr,       # cache reinterpreted as fp8_e4m3fn (1 byte/elem)
+    KV_BF16_ptr,      # cache reinterpreted as bfloat16   (2 bytes/elem)
+    KV_U8_ptr,        # cache reinterpreted as uint8      (1 byte/elem)
+    Indices_ptr,      # [B, 1, topk] int32  (flat token IDs page*P+row, -1 invalid)
+    TopkLen_ptr,      # [B] int32
+    Sink_ptr,         # [h_q] fp32
+    Out_ptr,          # [B, 1, h_q, 512] bf16 (pre-allocated)
+    Lse_ptr,          # [B, h_q, 1] fp32 (pre-allocated)
+    softmax_scale,
+    page_byte_stride,        # bytes per padded page (k_cache.stride(0))
+    P,                       # tokens per page (256 radix / 128 non-radix)
+    h_q,
+    stride_q_b, stride_q_h,  # element strides into Q
+    stride_idx_b,            # element stride into Indices
+    stride_o_b, stride_o_h,  # element strides into Out
+    stride_lse_b, stride_lse_h,  # element strides into Lse
+    BLOCK_M: tl.constexpr,         # 16
+    KV_CHUNK: tl.constexpr,        # 32
+    HEAD_DIM_NOPE: tl.constexpr,   # 448
+    HEAD_DIM_ROPE: tl.constexpr,   # 64
+    HEAD_DIM_QK: tl.constexpr,     # 512 (= NoPE + RoPE)
+    BLOCK_DV: tl.constexpr,        # 128 (output-dim tile; HEAD_DIM_QK/BLOCK_DV programs along z)
+    TOPK: tl.constexpr,            # padded topk (constexpr; multiple of KV_CHUNK)
+    NOPE_GROUPS: tl.constexpr,     # 7
+    GROUP_SIZE: tl.constexpr,      # 64 (NoPE elements per scale group)
+):
+    """One program covers BLOCK_M heads of one (b, s_q=0) decode row.
+
+    Layout per page (V4-Flash MODEL1_FP8Sparse, MUST match
+    `flashmla_tests.quant.dequantize_k_cache`):
+
+      Per token i in page:
+        bytes [i*576, i*576 + 448): NoPE FP8 E4M3
+        bytes [i*576 + 448, (i+1)*576): RoPE BF16 (64 elements)
+      Per token i (scale region, starts at byte P*576):
+        bytes [P*576 + i*8, P*576 + i*8 + 7): 7 UE8M0 group scales
+        byte  [P*576 + i*8 + 7]: pad
+
+    NoPE has 7 groups of 64 elements each. Element d in [0, 448) belongs to
+    group g = d // 64; dequantized value is fp8_val * 2**(byte_g - 127).
+
+    Indices: flat token IDs (page_id * P + row_in_page); -1 marks invalid.
+
+    Output dim is tiled along program-z: each (pid_dv) covers BLOCK_DV columns
+    of the [BLOCK_M, HEAD_DIM_QK] output. Q@K^T (and softmax) is recomputed
+    per program-z (each loads K_full once, redundant compute amortised by
+    avoiding cross-program reduction); only V@P writes the [BLOCK_M, BLOCK_DV]
+    accumulator slice. LSE is identical across z and is stored only by
+    pid_dv == 0.
+    """
+    pid_b = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_dv = tl.program_id(2)
+
+    h_offs = pid_h * BLOCK_M + tl.arange(0, BLOCK_M)
+    h_mask = h_offs < h_q
+
+    d_qk = tl.arange(0, HEAD_DIM_QK)              # 512 (full K width)
+    is_nope_d = d_qk < HEAD_DIM_NOPE              # bool [512]
+    nope_d_safe = tl.where(is_nope_d, d_qk, 0)
+    nope_group_d = nope_d_safe // GROUP_SIZE      # [512] in [0, 7]; 0 outside NoPE
+    rope_d_within = d_qk - HEAD_DIM_NOPE
+    rope_d_safe = tl.maximum(rope_d_within, 0)
+
+    # DV slice (output columns this program writes)
+    dv_offs = pid_dv * BLOCK_DV + tl.arange(0, BLOCK_DV)
+    is_nope_dv = dv_offs < HEAD_DIM_NOPE
+    nope_dv_safe = tl.where(is_nope_dv, dv_offs, 0)
+    nope_group_dv = nope_dv_safe // GROUP_SIZE
+    rope_dv_within = dv_offs - HEAD_DIM_NOPE
+    rope_dv_safe = tl.maximum(rope_dv_within, 0)
+
+    # Load Q [BLOCK_M, HEAD_DIM_QK] bf16. Q is contiguous [B, 1, h_q, 512]
+    # (s_q=1, so we ignore s_q stride).
+    q_ptrs = (Q_ptr
+              + pid_b * stride_q_b
+              + h_offs[:, None] * stride_q_h
+              + d_qk[None, :])
+    q_bf = tl.load(q_ptrs, mask=h_mask[:, None], other=0.0)
+
+    # Online softmax state — acc is the BLOCK_DV slice only.
+    m_i = tl.full([BLOCK_M], -float("inf"), dtype=tl.float32)
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DV], dtype=tl.float32)
+
+    topk_len = tl.load(TopkLen_ptr + pid_b)
+
+    # Iterate over selected positions in chunks of KV_CHUNK.
+    # TOPK is constexpr (padded multiple of KV_CHUNK), so this loop unrolls
+    # at compile time per Triton's static_range semantics for `range` over
+    # a constexpr.
+    for chunk_start in range(0, TOPK, KV_CHUNK):
+        kv_pos = chunk_start + tl.arange(0, KV_CHUNK)
+        in_topk = kv_pos < TOPK
+
+        flat_idx = tl.load(
+            Indices_ptr + pid_b * stride_idx_b + kv_pos,
+            mask=in_topk, other=-1,
+        )
+        # Position is valid iff (a) within topk_length, (b) flat index >= 0.
+        # The reference (`flashmla_tests/ref.py:81-87`) clamps min to 0 before
+        # gather; we replicate that to keep the address in-range, then mask
+        # the logit to -inf so it contributes nothing.
+        valid = (kv_pos < topk_len) & (flat_idx >= 0) & in_topk
+        flat_safe = tl.maximum(flat_idx, 0)
+
+        page_id = flat_safe // P
+        row = flat_safe % P
+        # int64 byte arithmetic — page_id * page_byte_stride can exceed 2^31
+        # for large pools (page_byte_stride ~150 KB).
+        page_id64 = page_id.to(tl.int64)
+        row64 = row.to(tl.int64)
+        token_byte_base = page_id64 * page_byte_stride + row64 * 576
+        scale_byte_base = page_id64 * page_byte_stride + P * 576 + row64 * 8
+
+        # ===== Build full K [KV_CHUNK, 512] for QK^T =====
+        # NoPE FP8 (masked outside NoPE; those positions become 0 then are
+        # overwritten by the RoPE branch via additive merge).
+        nope_byte_offs = token_byte_base[:, None] + nope_d_safe[None, :]
+        nope_load_mask = valid[:, None] & is_nope_d[None, :]
+        nope_fp32 = tl.load(
+            KV_FP8_ptr + nope_byte_offs,
+            mask=nope_load_mask, other=0.0,
+        ).to(tl.float32)
+
+        # Direct per-element scale gather: scale_byte[k, d] is at
+        #   uint8 offset = scale_byte_base[k] + nope_group_d[d]
+        # No tl.dot needed — this is a true gather, not a matmul.
+        scale_byte_offs = scale_byte_base[:, None] + nope_group_d[None, :]
+        scale_bytes = tl.load(
+            KV_U8_ptr + scale_byte_offs,
+            mask=nope_load_mask, other=0,
+        ).to(tl.float32)
+        nope_scale = tl.exp2(scale_bytes - 127.0)  # [KV_CHUNK, 512]
+        nope_deq = nope_fp32 * nope_scale          # 0 outside NoPE (mask)
+
+        # RoPE BF16. bf16 element offset = (byte offset) >> 1.
+        rope_elem_base = (token_byte_base + HEAD_DIM_NOPE) >> 1
+        rope_elem_offs = rope_elem_base[:, None] + rope_d_safe[None, :]
+        rope_load_mask = valid[:, None] & (~is_nope_d)[None, :]
+        rope_fp32 = tl.load(
+            KV_BF16_ptr + rope_elem_offs,
+            mask=rope_load_mask, other=0.0,
+        ).to(tl.float32)
+
+        k_full_bf = (nope_deq + rope_fp32).to(tl.bfloat16)
+
+        # QK^T: [BLOCK_M, 512] @ [512, KV_CHUNK] → [BLOCK_M, KV_CHUNK]
+        qk = tl.dot(q_bf, tl.trans(k_full_bf), out_dtype=tl.float32)
+        qk = qk * softmax_scale
+        qk = tl.where(valid[None, :], qk, -float("inf"))
+
+        # --- Online softmax update ---
+        m_chunk = tl.max(qk, axis=1)
+        m_new = tl.maximum(m_i, m_chunk)
+        # Guard against m_new == -inf (no valid tokens yet) → exp(-inf - -inf) = NaN.
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)        # rescales prior accumulator
+        p = tl.exp(qk - m_safe[:, None])    # qk = -inf masked → p = 0
+
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+
+        # ===== Build K_slice [KV_CHUNK, BLOCK_DV] for V@P =====
+        nope_dv_byte_offs = token_byte_base[:, None] + nope_dv_safe[None, :]
+        nope_dv_load_mask = valid[:, None] & is_nope_dv[None, :]
+        nope_dv_fp32 = tl.load(
+            KV_FP8_ptr + nope_dv_byte_offs,
+            mask=nope_dv_load_mask, other=0.0,
+        ).to(tl.float32)
+        scale_dv_byte_offs = scale_byte_base[:, None] + nope_group_dv[None, :]
+        scale_dv_bytes = tl.load(
+            KV_U8_ptr + scale_dv_byte_offs,
+            mask=nope_dv_load_mask, other=0,
+        ).to(tl.float32)
+        nope_dv_deq = nope_dv_fp32 * tl.exp2(scale_dv_bytes - 127.0)
+
+        rope_dv_elem_offs = rope_elem_base[:, None] + rope_dv_safe[None, :]
+        rope_dv_load_mask = valid[:, None] & (~is_nope_dv)[None, :]
+        rope_dv_fp32 = tl.load(
+            KV_BF16_ptr + rope_dv_elem_offs,
+            mask=rope_dv_load_mask, other=0.0,
+        ).to(tl.float32)
+
+        k_slice_bf = (nope_dv_deq + rope_dv_fp32).to(tl.bfloat16)
+
+        # acc += p @ K_slice → [BLOCK_M, BLOCK_DV]
+        acc = acc * alpha[:, None] + tl.dot(
+            p.to(tl.bfloat16), k_slice_bf, out_dtype=tl.float32,
+        )
+        m_i = m_new
+
+    # --- Epilogue: sink-scaled output, lonely-query correction ---
+    sink = tl.load(Sink_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
+    lonely = l_i == 0.0  # no valid tokens for this row
+
+    safe_l = tl.where(lonely, 1.0, l_i)
+    lse = tl.where(lonely, float("inf"), m_i + tl.log(safe_l))
+
+    o = acc / safe_l[:, None]
+    sink_factor = 1.0 / (1.0 + tl.exp(sink - lse))    # safe even when lse=+inf
+    o = o * sink_factor[:, None]
+    o = tl.where(lonely[:, None], 0.0, o)             # lonely → zero output
+
+    # Store output slice
+    o_ptrs = (Out_ptr
+              + pid_b * stride_o_b
+              + h_offs[:, None] * stride_o_h
+              + dv_offs[None, :])
+    tl.store(o_ptrs, o.to(tl.bfloat16), mask=h_mask[:, None])
+
+    # Store LSE only from pid_dv == 0 (identical across z).
+    if pid_dv == 0:
+        lse_ptrs = Lse_ptr + pid_b * stride_lse_b + h_offs * stride_lse_h
+        tl.store(lse_ptrs, lse, mask=h_mask)
+
+
+def flash_mla_with_kvcache_triton_sm120(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    *,
+    indices: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    head_dim_v: int = 512,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[torch.Tensor] = None,
+    tile_scheduler_metadata: Any = None,
+    is_fp8_kvcache: bool = True,
+    causal: bool = False,
+    num_splits: Optional[int] = None,
+    **_unused: Any,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """sm_120 Triton sparse MLA decode (SWA-only path, s_q==1).
+
+    Drop-in for `flash_mla.flash_mla_with_kvcache(..., indices=...)` matching
+    the live call site at
+    `deepseek_v4_backend_radix.py:1074-1089`. Returns
+    `(output bf16 [B, 1, h_q, 512], lse fp32 [B, h_q, 1])`.
+
+    All contract assertions match the wrapper preconditions enumerated in
+    `sparse_mla_backend.get_sparse_mla_decode_backend`'s `_triton_supported`
+    predicate; the dispatcher routes incompatible calls elsewhere, but the
+    asserts here are defence-in-depth.
+    """
+    # Contract: live call site never passes these.
+    assert block_table is None
+    assert cache_seqlens is None
+    assert is_fp8_kvcache is True
+    assert not causal
+    assert num_splits in (None, 1)
+
+    # SWA-only (compressed layers route to TORCH today; covered in Phase 6.7).
+    assert extra_k_cache is None
+    assert extra_indices_in_kvcache is None
+    assert extra_topk_length is None
+
+    assert q.ndim == 4, f"q must be [B, s_q, h_q, d_qk]; got {tuple(q.shape)}"
+    B, s_q, h_q, d_qk = q.shape
+    assert s_q == 1, "Triton sparse-MLA path only supports s_q==1 (Phase 6.8 covers s_q>1)"
+    assert d_qk == 512
+    assert head_dim_v == 512
+    assert h_q % 16 == 0, f"h_q must be divisible by BLOCK_M=16; got {h_q}"
+    assert q.dtype == torch.bfloat16
+    # Kernel relies on contiguous innermost stride for Q (per-element pointer
+    # arithmetic over d_qk uses unit stride implicitly).
+    assert q.stride(3) == 1, f"q must be contiguous on last dim; got stride {q.stride(3)}"
+
+    assert k_cache.ndim == 4 and k_cache.shape[2] == 1 and k_cache.shape[3] == 584
+    assert k_cache.dtype == torch.uint8
+    P = k_cache.shape[1]
+    page_byte_stride = k_cache.stride(0) * k_cache.element_size()
+    assert page_byte_stride % 576 == 0, (
+        f"page byte stride {page_byte_stride} must be a multiple of 576"
+    )
+    assert page_byte_stride >= P * 584, (
+        f"page byte stride {page_byte_stride} too small for P={P}"
+    )
+    assert page_byte_stride % 2 == 0  # required for bf16 view alignment
+
+    assert indices is not None and indices.ndim == 3
+    assert indices.shape == (B, 1, indices.shape[-1])
+    topk = indices.shape[-1]
+    assert topk % 64 == 0
+    assert indices.dtype == torch.int32
+    # Kernel uses unit-stride access along the topk dim.
+    assert indices.stride(2) == 1, (
+        f"indices must be contiguous on last dim; got stride {indices.stride(2)}"
+    )
+
+    assert topk_length is not None
+    assert topk_length.shape == (B,)
+    assert topk_length.dtype == torch.int32
+
+    assert attn_sink is not None
+    assert attn_sink.shape == (h_q,)
+
+    devices = {q.device, k_cache.device, indices.device,
+               topk_length.device, attn_sink.device}
+    assert len(devices) == 1, f"all tensors must share a device; got {devices}"
+    assert q.is_cuda
+
+    if softmax_scale is None:
+        softmax_scale = float(d_qk) ** -0.5
+    softmax_scale = float(softmax_scale)
+
+    # Reinterpret the cache storage at three dtypes (no copy).
+    kv_fp8 = k_cache.view(torch.float8_e4m3fn)
+    kv_bf16 = k_cache.view(torch.bfloat16)
+    kv_u8 = k_cache  # already uint8
+
+    # Pre-allocate outputs.
+    output = torch.empty((B, 1, h_q, head_dim_v), dtype=torch.bfloat16, device=q.device)
+    lse = torch.empty((B, h_q, 1), dtype=torch.float32, device=q.device)
+
+    # Strides (in element units of the relevant tensor).
+    stride_q_b = q.stride(0)
+    stride_q_h = q.stride(2)
+    stride_idx_b = indices.stride(0)
+    stride_o_b = output.stride(0)
+    stride_o_h = output.stride(2)
+    stride_lse_b = lse.stride(0)
+    stride_lse_h = lse.stride(1)
+
+    BLOCK_M = 16
+    KV_CHUNK = 32
+    HEAD_DIM_NOPE = 448
+    HEAD_DIM_ROPE = 64
+    HEAD_DIM_QK = 512
+    BLOCK_DV = 128
+    assert HEAD_DIM_QK % BLOCK_DV == 0
+
+    # Cast attn_sink to fp32 for stable epilogue arithmetic.
+    sink_fp32 = attn_sink.to(torch.float32)
+
+    grid = (B, h_q // BLOCK_M, HEAD_DIM_QK // BLOCK_DV)
+    _sparse_mla_decode_kernel[grid](
+        q,
+        kv_fp8,
+        kv_bf16,
+        kv_u8,
+        indices,
+        topk_length,
+        sink_fp32,
+        output,
+        lse,
+        softmax_scale,
+        page_byte_stride,
+        P,
+        h_q,
+        stride_q_b, stride_q_h,
+        stride_idx_b,
+        stride_o_b, stride_o_h,
+        stride_lse_b, stride_lse_h,
+        BLOCK_M=BLOCK_M,
+        KV_CHUNK=KV_CHUNK,
+        HEAD_DIM_NOPE=HEAD_DIM_NOPE,
+        HEAD_DIM_ROPE=HEAD_DIM_ROPE,
+        HEAD_DIM_QK=HEAD_DIM_QK,
+        BLOCK_DV=BLOCK_DV,
+        TOPK=topk,
+        NOPE_GROUPS=7,
+        GROUP_SIZE=64,
+    )
+
+    return output, lse
+
+
 if __name__ == "__main__":
     compile_aot()
