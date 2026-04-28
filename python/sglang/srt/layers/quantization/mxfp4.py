@@ -747,6 +747,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.w2_weight_triton_tensor = w2_weight
             del layer.w13_weight
             del layer.w2_weight
+            # _swizzle_mxfp4 -> convert_layout produced fresh scale tensors
+            # in w13_scale / w2_scale; the original uint8 layer scale params
+            # are dead storage and tighten the per-rank headroom.
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
         else:
             from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
 
