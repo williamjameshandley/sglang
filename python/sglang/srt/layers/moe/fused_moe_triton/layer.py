@@ -607,7 +607,13 @@ class FusedMoE(torch.nn.Module):
             else:
                 dim1 = loaded_weight.shape[1]
                 dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                dst = param.data[:, :dim1, :dim2]
+                if (
+                    dst.dtype == torch.uint8
+                    and loaded_weight.dtype == torch.float8_e8m0fnu
+                ):
+                    loaded_weight = loaded_weight.view(torch.uint8)
+                dst.copy_(loaded_weight)
             return
 
         global_expert_location_metadata = get_global_expert_location_metadata()
@@ -978,6 +984,11 @@ class FusedMoE(torch.nn.Module):
                 dim1 = loaded_weight.shape[1]
                 param.data[:, :dim1].copy_(loaded_weight)
             elif "scale" in weight_name:
+                if (
+                    param.data.dtype == torch.uint8
+                    and loaded_weight.dtype == torch.float8_e8m0fnu
+                ):
+                    loaded_weight = loaded_weight.view(torch.uint8)
                 param.data.copy_(loaded_weight)
             else:
                 dim1 = loaded_weight.shape[1]
