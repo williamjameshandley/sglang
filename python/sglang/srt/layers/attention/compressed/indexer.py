@@ -539,21 +539,34 @@ class C4IndexerBackend:
         )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
-        # CUDA path: use deep_gemm
-        if envs.SGLANG_OPT_USE_TILELANG_INDEXER.get():
+        from sglang.srt.layers.attention.compressed.paged_mqa_backend import (
+            PagedMQALogitsBackend,
+            get_paged_mqa_logits_backend,
+        )
+
+        backend = get_paged_mqa_logits_backend()
+        if backend is PagedMQALogitsBackend.TILELANG:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits as fn,
             )
-        # elif is_hip():
-        elif envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
+        elif backend is PagedMQALogitsBackend.TORCH:
             fn = fp8_paged_mqa_logits_torch
+        elif backend is PagedMQALogitsBackend.TRITON_SM120:
+            # Phase 5.3.1: enum branch exists but the kernel isn't wired
+            # yet. Fall through to torch reference; the conf still sets
+            # SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 so this branch is
+            # currently unreachable. Phase 5.3.2 will replace this
+            # NotImplementedError with the real Triton kernel import.
+            raise NotImplementedError(
+                "TRITON_SM120 fp8_paged_mqa_logits kernel not yet implemented; "
+                "set SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 until Phase 5.3.2 lands"
+            )
+        elif backend is PagedMQALogitsBackend.DEEP_GEMM_CHUNKED:
+            from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
+                fp8_paged_mqa_logits_chunked as fn,
+            )
         else:
-            if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
-                from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
-                    fp8_paged_mqa_logits_chunked as fn,
-                )
-            else:
-                from deep_gemm import fp8_paged_mqa_logits as fn
+            from deep_gemm import fp8_paged_mqa_logits as fn
 
         logits = fn(
             q_fp8,

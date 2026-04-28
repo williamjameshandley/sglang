@@ -128,10 +128,15 @@ class PagedIndexerMetadata(IndexerMetadata):
     deep_gemm_metadata: Any = field(init=False, repr=False)
 
     def __post_init__(self):
-        # if is_hip():
-        if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get():
-            # For HIP/ROCm, we don't need deep_gemm metadata
-            # Will use aiter's deepgemm_fp8_paged_mqa_logits instead
+        from sglang.srt.layers.attention.compressed.paged_mqa_backend import (
+            get_paged_mqa_logits_backend,
+            uses_deep_gemm_metadata,
+        )
+
+        backend = get_paged_mqa_logits_backend()
+        if not uses_deep_gemm_metadata(backend):
+            # torch fallback / HIP / sm_120 Triton / TileLang: no DeepGEMM
+            # metadata is consumed downstream.
             self.deep_gemm_metadata = None
         else:
             import deep_gemm
@@ -168,19 +173,26 @@ class PagedIndexerMetadata(IndexerMetadata):
         return self.page_table.shape[1] * self.page_size
 
     def copy_(self, other: "PagedIndexerMetadata"):
-        if is_hip():
-            copy_metadata(
-                src=other,
-                dst=self,
-                check_eq_fields=["page_size", "deep_gemm_metadata"],
-                copy_fields=["page_table", "c4_seq_lens"],
-            )
-        else:
+        from sglang.srt.layers.attention.compressed.paged_mqa_backend import (
+            get_paged_mqa_logits_backend,
+            uses_deep_gemm_metadata,
+        )
+
+        if uses_deep_gemm_metadata(get_paged_mqa_logits_backend()):
             copy_metadata(
                 src=other,
                 dst=self,
                 check_eq_fields=["page_size"],
                 copy_fields=["page_table", "c4_seq_lens", "deep_gemm_metadata"],
+            )
+        else:
+            # torch / sm_120 Triton / TileLang / HIP: deep_gemm_metadata is
+            # always None on both sides; check equality rather than copy.
+            copy_metadata(
+                src=other,
+                dst=self,
+                check_eq_fields=["page_size", "deep_gemm_metadata"],
+                copy_fields=["page_table", "c4_seq_lens"],
             )
 
 
