@@ -221,6 +221,95 @@ class TritonKernelTopKOutput(NamedTuple):
         return TopKOutputFormat.TRITON_KERNEL
 
 
+def to_triton_kernels_format(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    router_logits: torch.Tensor,
+    n_expts_tot: int,
+    n_expts_act: int,
+    num_token_non_padded: Optional[torch.Tensor],
+    expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
+) -> "TritonKernelTopKOutput":
+    """Build a TritonKernelTopKOutput from already-computed topk_weights/ids.
+
+    Re-uses the caller's `topk_ids` to derive the bitmatrix, and threads
+    the caller's `topk_weights` through `routing_from_bitmatrix` so they
+    survive into `RoutingData.gate_scal`. We do NOT call
+    `routing(router_logits, expt_indx=topk_ids)` because that path
+    re-derives weights from selected-logit softmax, discarding the
+    caller's scoring/normalization.
+
+    Pads `n_expts_act` to the next power of 2 by appending unique unused
+    expert IDs with zero weight. The triton-kernels routing kernels
+    require pow-2 N_EXPTS_ACT in `tl.arange(0, N_EXPTS_ACT)` and
+    `tl.arange(0, N_EXPTS_ACT * BLOCK_M)`; padding preserves the
+    bitmatrix-histogram / gate-list invariant (k_pow2 unique bits per
+    token, N*k_pow2 gate entries pointing to those experts).
+
+    Used for V4-Flash whose `num_experts_per_tok=6` is not pow-2, by both
+    HashTopK (hash-routed layers) and TopK (canonical layers).
+    """
+    assert num_token_non_padded is None, (
+        "to_triton_kernels_format does not support padded-region masking; "
+        "-1 indices in topk_ids would corrupt the bitmatrix"
+    )
+    assert expert_location_dispatch_info is None, (
+        "to_triton_kernels_format does not support EPLB (logical->physical "
+        "ID remap); router_logits columns are logical, gathering via "
+        "physical IDs would index wrong columns"
+    )
+
+    from triton_kernels.routing import routing_from_bitmatrix
+    from triton_kernels.topk import topk_forward
+
+    # Per-token uniqueness in the real top-k is required: the bitmatrix
+    # records (token, expert) as binary; duplicates would shrink the
+    # histogram below the gate-list count and corrupt routing offsets.
+    sorted_ids, _ = topk_ids.sort(dim=1)
+    assert not (
+        sorted_ids[:, 1:] == sorted_ids[:, :-1]
+    ).any(), "to_triton_kernels_format requires unique expert IDs per token"
+
+    n_expts_act_pow2 = 1 << max(0, n_expts_act - 1).bit_length()
+    if n_expts_act_pow2 != n_expts_act:
+        pad = n_expts_act_pow2 - n_expts_act
+        n_tokens = topk_ids.shape[0]
+        # Find `pad` unused expert IDs per token via topk on (~used) mask;
+        # values 1 (unused) sort above 0 (used), so torch.topk yields
+        # `pad` distinct unused IDs per row. Identity does not matter, only
+        # that they are unused (so bitmatrix has k_pow2 bits set per token)
+        # and distinct (so gate list and bitmatrix describe the same
+        # routing).
+        used = torch.zeros(
+            n_tokens, n_expts_tot, dtype=torch.bool, device=topk_ids.device
+        )
+        used.scatter_(1, topk_ids.long(), True)
+        _, pad_ids = torch.topk((~used).to(torch.int32), k=pad, dim=1)
+        pad_ids = pad_ids.to(topk_ids.dtype)
+        pad_weights = torch.zeros(
+            n_tokens, pad, dtype=topk_weights.dtype, device=topk_weights.device
+        )
+        topk_weights = torch.cat([topk_weights, pad_weights], dim=-1)
+        topk_ids = torch.cat([topk_ids, pad_ids], dim=-1)
+        n_expts_act = n_expts_act_pow2
+
+    y_indx_i16 = topk_ids.to(torch.int16)
+    _, _, bitmatrix = topk_forward(
+        router_logits,
+        n_expts_act,
+        apply_softmax=False,
+        y_indx=y_indx_i16,
+    )
+    routing_data, gather_idx, scatter_idx = routing_from_bitmatrix(
+        bitmatrix,
+        topk_weights,
+        y_indx_i16,
+        n_expts_tot,
+        n_expts_act,
+    )
+    return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
+
+
 class BypassedTopKOutput(NamedTuple):
     """Bypassed top-k output format."""
 
@@ -329,13 +418,77 @@ class TopK(MultiPlatformOp):
             output_format = TopKOutputFormat.STANDARD
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
-            # renormalize=True is equivalent to sm_first=False
-            routing_data, gather_idx, scatter_idx = routing(
-                router_logits,
-                self.topk_config.top_k,
-                sm_first=not self.topk_config.renormalize,
+            top_k = self.topk_config.top_k
+            n_expts_act_pow2 = 1 << max(0, top_k - 1).bit_length()
+            if n_expts_act_pow2 == top_k:
+                # renormalize=True is equivalent to sm_first=False
+                routing_data, gather_idx, scatter_idx = routing(
+                    router_logits,
+                    top_k,
+                    sm_first=not self.topk_config.renormalize,
+                )
+                return TritonKernelTopKOutput(
+                    routing_data, gather_idx, scatter_idx
+                )
+            # Non-pow-2 top-k (e.g. V4-Flash's 6): triton-kernels routing
+            # internally calls `tl.arange(0, N_EXPTS_ACT)` which requires
+            # pow-2. Compute topk in torch, then route through the shared
+            # padding helper so the kernel sees pow-2 N_EXPTS_ACT while the
+            # gate list keeps the real top-k entries.
+            #
+            # The torch reproduction here only mirrors plain-softmax routing
+            # (sm_first respected, no correction_bias, no grouped_topk, no
+            # custom_routing_function, no fused shared experts, no
+            # post-output routed-scale fold). Hard-assert these so any other
+            # TopKConfig variant fails cleanly instead of silently routing
+            # tokens by the wrong scoring rule.
+            assert self.topk_config.scoring_func == "softmax", (
+                "Non-pow-2 TRITON_KERNEL TopK fallback only supports "
+                "scoring_func='softmax'; "
+                f"got {self.topk_config.scoring_func!r}"
             )
-            return TritonKernelTopKOutput(routing_data, gather_idx, scatter_idx)
+            assert self.topk_config.correction_bias is None, (
+                "Non-pow-2 TRITON_KERNEL TopK fallback does not support "
+                "correction_bias"
+            )
+            assert not self.topk_config.use_grouped_topk, (
+                "Non-pow-2 TRITON_KERNEL TopK fallback does not support "
+                "use_grouped_topk"
+            )
+            assert self.topk_config.custom_routing_function is None, (
+                "Non-pow-2 TRITON_KERNEL TopK fallback does not support "
+                "custom_routing_function"
+            )
+            assert self.topk_config.num_fused_shared_experts == 0, (
+                "Non-pow-2 TRITON_KERNEL TopK fallback does not support "
+                "num_fused_shared_experts > 0"
+            )
+            assert not self.topk_config.apply_routed_scaling_factor_on_output, (
+                "Non-pow-2 TRITON_KERNEL TopK fallback does not support "
+                "apply_routed_scaling_factor_on_output"
+            )
+
+            sm_first = not self.topk_config.renormalize
+            if sm_first:
+                scores = torch.softmax(router_logits, dim=-1)
+                topk_weights, topk_ids = torch.topk(scores, top_k, dim=-1)
+            else:
+                raw_top_vals, topk_ids = torch.topk(
+                    router_logits, top_k, dim=-1
+                )
+                topk_weights = torch.softmax(raw_top_vals, dim=-1)
+            # `select_experts` returns gate scalars in float32; mirror that
+            # so RoutingData.gate_scal isn't silently bf16/fp16.
+            topk_weights = topk_weights.to(torch.float32)
+            return to_triton_kernels_format(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids.to(torch.int32),
+                router_logits=router_logits,
+                n_expts_tot=router_logits.shape[-1],
+                n_expts_act=top_k,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+            )
         elif output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
