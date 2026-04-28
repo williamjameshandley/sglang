@@ -328,6 +328,12 @@ def to_triton_kernels_format(
     # entries; padded entries contribute zero to the matmul output.
     n_expts_act_pow2 = 1 << max(0, n_expts_act - 1).bit_length()
     if n_expts_act_pow2 != n_expts_act:
+        # Need to draw `pad` unique unused expert IDs per token; only
+        # possible if there are at least that many spare experts overall.
+        assert n_expts_act_pow2 <= n_expts_tot, (
+            f"Cannot pow-2 pad top_k {n_expts_act} to {n_expts_act_pow2} "
+            f"with only {n_expts_tot} total experts"
+        )
         pad = n_expts_act_pow2 - n_expts_act
         n_tokens = topk_ids.shape[0]
         used = torch.zeros(
