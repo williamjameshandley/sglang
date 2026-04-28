@@ -129,10 +129,20 @@ def _run_case(
     sink_zeros: bool,
     device: torch.device,
     seed: int,
+    # Phase 6.7 optional compressed scope
+    P_extra: int = 0,
+    extra_num_pages: int = 0,
+    extra_topk: int = 0,
+    extra_topk_lengths: Optional[list[int]] = None,
+    extra_sprinkle_neg1: bool = False,
 ) -> bool:
     assert len(topk_lengths) == B
     assert topk % 64 == 0
     assert h_q % 16 == 0
+    has_extra = P_extra > 0
+    if has_extra:
+        assert extra_topk_lengths is not None and len(extra_topk_lengths) == B
+        assert extra_topk % 64 == 0
 
     g = torch.Generator(device=device).manual_seed(seed + 7)
 
@@ -150,6 +160,24 @@ def _run_case(
     )
     topk_length = torch.tensor(topk_lengths, dtype=torch.int32, device=device)
 
+    extra_k_cache = None
+    extra_indices = None
+    extra_topk_length = None
+    if has_extra:
+        extra_k_cache = _build_quantized_cache(
+            extra_num_pages, P_extra, device, seed=seed + 100,
+        )
+        if extra_k_cache.stride(0) % 576 != 0:
+            print(f"[FAIL] {name}: extra pool stride not %576==0")
+            return False
+        extra_indices = _gen_indices(
+            B, extra_topk, extra_num_pages, P_extra,
+            extra_topk_lengths, extra_sprinkle_neg1, device, seed=seed + 200,
+        )
+        extra_topk_length = torch.tensor(
+            extra_topk_lengths, dtype=torch.int32, device=device,
+        )
+
     if sink_zeros:
         attn_sink = torch.zeros(h_q, dtype=torch.float32, device=device)
     else:
@@ -166,6 +194,9 @@ def _run_case(
         head_dim_v=512,
         is_fp8_kvcache=True,
         causal=False,
+        extra_k_cache=extra_k_cache,
+        extra_indices_in_kvcache=extra_indices,
+        extra_topk_length=extra_topk_length,
     )
 
     out_a, lse_a = flash_mla_with_kvcache_torch_reference(**common_kwargs)
@@ -232,10 +263,10 @@ def _call_oracle_b(kwargs: dict) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
             is_fp8_kvcache=True,
             indices=kwargs["indices"],
             attn_sink=kwargs["attn_sink"],
-            extra_k_cache=None,
-            extra_indices_in_kvcache=None,
+            extra_k_cache=kwargs.get("extra_k_cache"),
+            extra_indices_in_kvcache=kwargs.get("extra_indices_in_kvcache"),
             topk_length=kwargs["topk_length"],
-            extra_topk_length=None,
+            extra_topk_length=kwargs.get("extra_topk_length"),
         )
     except Exception as e:
         print(f"       Oracle B raised: {type(e).__name__}: {e}")
@@ -303,6 +334,42 @@ def main() -> int:
             B=4, h_q=64, P=256, num_pages=16, topk=128,
             topk_lengths=[64, 100, 128, 33], sprinkle_neg1=True,
             sink_zeros=False, seed=10,
+        ),
+        # Phase 6.7 compressed-scope cases
+        dict(
+            name="C4 B=1 h=64 P=256 topk=64 + P_extra=64 etopk=64",
+            B=1, h_q=64, P=256, num_pages=8, topk=64,
+            topk_lengths=[40], sprinkle_neg1=False, sink_zeros=False, seed=20,
+            P_extra=64, extra_num_pages=8, extra_topk=64,
+            extra_topk_lengths=[30], extra_sprinkle_neg1=False,
+        ),
+        dict(
+            name="C4 B=2 h=128 P=256 topk=128 + P_extra=64 etopk=128 -1",
+            B=2, h_q=128, P=256, num_pages=16, topk=128,
+            topk_lengths=[100, 64], sprinkle_neg1=True, sink_zeros=False, seed=21,
+            P_extra=64, extra_num_pages=16, extra_topk=128,
+            extra_topk_lengths=[80, 50], extra_sprinkle_neg1=True,
+        ),
+        dict(
+            name="C128 B=1 h=64 P=256 topk=64 + P_extra=2 etopk=64",
+            B=1, h_q=64, P=256, num_pages=8, topk=64,
+            topk_lengths=[50], sprinkle_neg1=False, sink_zeros=False, seed=22,
+            P_extra=2, extra_num_pages=64, extra_topk=64,
+            extra_topk_lengths=[40], extra_sprinkle_neg1=False,
+        ),
+        dict(
+            name="C4 lonely both scopes (B=1 lens=0 elens=0)",
+            B=1, h_q=64, P=256, num_pages=8, topk=64,
+            topk_lengths=[0], sprinkle_neg1=False, sink_zeros=False, seed=23,
+            P_extra=64, extra_num_pages=8, extra_topk=64,
+            extra_topk_lengths=[0], extra_sprinkle_neg1=False,
+        ),
+        dict(
+            name="C4 only-compressed-valid (lens=0 elens>0)",
+            B=1, h_q=64, P=256, num_pages=8, topk=64,
+            topk_lengths=[0], sprinkle_neg1=False, sink_zeros=False, seed=24,
+            P_extra=64, extra_num_pages=8, extra_topk=64,
+            extra_topk_lengths=[40], extra_sprinkle_neg1=False,
         ),
     ]
 

@@ -1024,20 +1024,31 @@ def fp8_paged_mqa_logits_triton(
 @triton.jit
 def _sparse_mla_decode_kernel(
     Q_ptr,            # [B, 1, h_q, 512] bf16
-    KV_FP8_ptr,       # cache reinterpreted as fp8_e4m3fn (1 byte/elem)
-    KV_BF16_ptr,      # cache reinterpreted as bfloat16   (2 bytes/elem)
-    KV_U8_ptr,        # cache reinterpreted as uint8      (1 byte/elem)
+    KV_FP8_ptr,       # primary cache reinterpreted as fp8_e4m3fn
+    KV_BF16_ptr,      # primary cache reinterpreted as bfloat16
+    KV_U8_ptr,        # primary cache reinterpreted as uint8
     Indices_ptr,      # [B, 1, topk] int32  (flat token IDs page*P+row, -1 invalid)
     TopkLen_ptr,      # [B] int32
     Sink_ptr,         # [h_q] fp32
     Out_ptr,          # [B, 1, h_q, 512] bf16 (pre-allocated)
     Lse_ptr,          # [B, h_q, 1] fp32 (pre-allocated)
+    # Optional second (compressed C4/C128) cache for Phase 6.7 combined-scope.
+    # When HAS_EXTRA is False these may be the primary tensors (unused) — the
+    # second loop is gated out at compile time.
+    EXTRA_KV_FP8_ptr,
+    EXTRA_KV_BF16_ptr,
+    EXTRA_KV_U8_ptr,
+    EXTRA_Indices_ptr,
+    EXTRA_TopkLen_ptr,
     softmax_scale,
-    page_byte_stride,        # bytes per padded page (k_cache.stride(0))
-    P,                       # tokens per page (256 radix / 128 non-radix)
+    page_byte_stride,        # bytes per padded page of the primary cache
+    P,                       # tokens per primary page
+    extra_page_byte_stride,  # bytes per padded page of the compressed cache
+    P_EXTRA,                 # tokens per compressed page (page_size//4 or //128)
     h_q,
     stride_q_b, stride_q_h,  # element strides into Q
-    stride_idx_b,            # element stride into Indices
+    stride_idx_b,            # element stride into primary Indices
+    stride_extra_idx_b,      # element stride into compressed Indices
     stride_o_b, stride_o_h,  # element strides into Out
     stride_lse_b, stride_lse_h,  # element strides into Lse
     BLOCK_M: tl.constexpr,         # 16
@@ -1046,7 +1057,9 @@ def _sparse_mla_decode_kernel(
     HEAD_DIM_ROPE: tl.constexpr,   # 64
     HEAD_DIM_QK: tl.constexpr,     # 512 (= NoPE + RoPE)
     BLOCK_DV: tl.constexpr,        # 128 (output-dim tile; HEAD_DIM_QK/BLOCK_DV programs along z)
-    TOPK: tl.constexpr,            # padded topk (constexpr; multiple of KV_CHUNK)
+    TOPK: tl.constexpr,            # padded primary topk (constexpr; multiple of KV_CHUNK)
+    EXTRA_TOPK: tl.constexpr,      # padded compressed topk (0 when HAS_EXTRA is False)
+    HAS_EXTRA: tl.constexpr,       # True iff compressed scope present
     NOPE_GROUPS: tl.constexpr,     # 7
     GROUP_SIZE: tl.constexpr,      # 64 (NoPE elements per scale group)
 ):
@@ -1215,6 +1228,100 @@ def _sparse_mla_decode_kernel(
         )
         m_i = m_new
 
+    # ===== Phase 6.7: compressed scope (combined online softmax) =====
+    # Iterate over compressed-cache selected tokens with the SAME m_i/l_i/acc
+    # state. Mathematically this is one combined logsumexp over the
+    # concatenation of SWA-selected and compressed-selected tokens, exactly
+    # matching `flashmla_tests/ref.py:96-104,120-130`.
+    if HAS_EXTRA:
+        extra_topk_len = tl.load(EXTRA_TopkLen_ptr + pid_b)
+
+        for chunk_start in range(0, EXTRA_TOPK, KV_CHUNK):
+            kv_pos = chunk_start + tl.arange(0, KV_CHUNK)
+            in_topk = kv_pos < EXTRA_TOPK
+
+            flat_idx = tl.load(
+                EXTRA_Indices_ptr + pid_b * stride_extra_idx_b + kv_pos,
+                mask=in_topk, other=-1,
+            )
+            valid = (kv_pos < extra_topk_len) & (flat_idx >= 0) & in_topk
+            flat_safe = tl.maximum(flat_idx, 0)
+
+            page_id = flat_safe // P_EXTRA
+            row = flat_safe % P_EXTRA
+            page_id64 = page_id.to(tl.int64)
+            row64 = row.to(tl.int64)
+            token_byte_base = page_id64 * extra_page_byte_stride + row64 * 576
+            scale_byte_base = (
+                page_id64 * extra_page_byte_stride + P_EXTRA * 576 + row64 * 8
+            )
+
+            # === Build full K [KV_CHUNK, 512] for QK^T from compressed cache ===
+            nope_byte_offs = token_byte_base[:, None] + nope_d_safe[None, :]
+            nope_load_mask = valid[:, None] & is_nope_d[None, :]
+            nope_fp32 = tl.load(
+                EXTRA_KV_FP8_ptr + nope_byte_offs,
+                mask=nope_load_mask, other=0.0,
+            ).to(tl.float32)
+
+            scale_byte_offs = scale_byte_base[:, None] + nope_group_d[None, :]
+            scale_bytes = tl.load(
+                EXTRA_KV_U8_ptr + scale_byte_offs,
+                mask=nope_load_mask, other=0,
+            ).to(tl.float32)
+            nope_scale = tl.exp2(scale_bytes - 127.0)
+            nope_deq = nope_fp32 * nope_scale
+
+            rope_elem_base = (token_byte_base + HEAD_DIM_NOPE) >> 1
+            rope_elem_offs = rope_elem_base[:, None] + rope_d_safe[None, :]
+            rope_load_mask = valid[:, None] & (~is_nope_d)[None, :]
+            rope_fp32 = tl.load(
+                EXTRA_KV_BF16_ptr + rope_elem_offs,
+                mask=rope_load_mask, other=0.0,
+            ).to(tl.float32)
+
+            k_full_bf = (nope_deq + rope_fp32).to(tl.bfloat16)
+
+            qk = tl.dot(q_bf, tl.trans(k_full_bf), out_dtype=tl.float32)
+            qk = qk * softmax_scale
+            qk = tl.where(valid[None, :], qk, -float("inf"))
+
+            m_chunk = tl.max(qk, axis=1)
+            m_new = tl.maximum(m_i, m_chunk)
+            m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+            alpha = tl.exp(m_i - m_safe)
+            p = tl.exp(qk - m_safe[:, None])
+
+            l_i = l_i * alpha + tl.sum(p, axis=1)
+
+            # === Build K_slice [KV_CHUNK, BLOCK_DV] for V@P from compressed ===
+            nope_dv_byte_offs = token_byte_base[:, None] + nope_dv_safe[None, :]
+            nope_dv_load_mask = valid[:, None] & is_nope_dv[None, :]
+            nope_dv_fp32 = tl.load(
+                EXTRA_KV_FP8_ptr + nope_dv_byte_offs,
+                mask=nope_dv_load_mask, other=0.0,
+            ).to(tl.float32)
+            scale_dv_byte_offs = scale_byte_base[:, None] + nope_group_dv[None, :]
+            scale_dv_bytes = tl.load(
+                EXTRA_KV_U8_ptr + scale_dv_byte_offs,
+                mask=nope_dv_load_mask, other=0,
+            ).to(tl.float32)
+            nope_dv_deq = nope_dv_fp32 * tl.exp2(scale_dv_bytes - 127.0)
+
+            rope_dv_elem_offs = rope_elem_base[:, None] + rope_dv_safe[None, :]
+            rope_dv_load_mask = valid[:, None] & (~is_nope_dv)[None, :]
+            rope_dv_fp32 = tl.load(
+                EXTRA_KV_BF16_ptr + rope_dv_elem_offs,
+                mask=rope_dv_load_mask, other=0.0,
+            ).to(tl.float32)
+
+            k_slice_bf = (nope_dv_deq + rope_dv_fp32).to(tl.bfloat16)
+
+            acc = acc * alpha[:, None] + tl.dot(
+                p.to(tl.bfloat16), k_slice_bf, out_dtype=tl.float32,
+            )
+            m_i = m_new
+
     # --- Epilogue: sink-scaled output, lonely-query correction ---
     sink = tl.load(Sink_ptr + h_offs, mask=h_mask, other=0.0).to(tl.float32)
     lonely = l_i == 0.0  # no valid tokens for this row
@@ -1260,7 +1367,10 @@ def flash_mla_with_kvcache_triton_sm120(
     num_splits: Optional[int] = None,
     **_unused: Any,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """sm_120 Triton sparse MLA decode (SWA-only path, s_q==1).
+    """sm_120 Triton sparse MLA decode (s_q==1).
+
+    Phase 6.2: SWA-only (extra_k_cache None).
+    Phase 6.7: combined SWA + compressed C4/C128 (extra_k_cache non-None).
 
     Drop-in for `flash_mla.flash_mla_with_kvcache(..., indices=...)` matching
     the live call site at
@@ -1279,10 +1389,14 @@ def flash_mla_with_kvcache_triton_sm120(
     assert not causal
     assert num_splits in (None, 1)
 
-    # SWA-only (compressed layers route to TORCH today; covered in Phase 6.7).
-    assert extra_k_cache is None
-    assert extra_indices_in_kvcache is None
-    assert extra_topk_length is None
+    # Compressed-scope contract: all-or-nothing trio.
+    has_extra = extra_k_cache is not None
+    if has_extra:
+        assert extra_indices_in_kvcache is not None
+        assert extra_topk_length is not None
+    else:
+        assert extra_indices_in_kvcache is None
+        assert extra_topk_length is None
 
     assert q.ndim == 4, f"q must be [B, s_q, h_q, d_qk]; got {tuple(q.shape)}"
     B, s_q, h_q, d_qk = q.shape
@@ -1326,6 +1440,39 @@ def flash_mla_with_kvcache_triton_sm120(
 
     devices = {q.device, k_cache.device, indices.device,
                topk_length.device, attn_sink.device}
+    if has_extra:
+        assert extra_k_cache.ndim == 4 and extra_k_cache.shape[2] == 1
+        assert extra_k_cache.shape[3] == 584
+        assert extra_k_cache.dtype == torch.uint8
+        P_extra = extra_k_cache.shape[1]
+        extra_page_byte_stride = (
+            extra_k_cache.stride(0) * extra_k_cache.element_size()
+        )
+        assert extra_page_byte_stride % 576 == 0
+        assert extra_page_byte_stride >= P_extra * 584
+        assert extra_page_byte_stride % 2 == 0
+
+        assert extra_indices_in_kvcache.ndim == 3
+        assert extra_indices_in_kvcache.shape[0] == B
+        assert extra_indices_in_kvcache.shape[1] == 1
+        extra_topk = extra_indices_in_kvcache.shape[-1]
+        assert extra_topk % 64 == 0
+        assert extra_indices_in_kvcache.dtype == torch.int32
+        assert extra_indices_in_kvcache.stride(2) == 1
+
+        assert extra_topk_length.shape == (B,)
+        assert extra_topk_length.dtype == torch.int32
+
+        devices.update({
+            extra_k_cache.device,
+            extra_indices_in_kvcache.device,
+            extra_topk_length.device,
+        })
+    else:
+        P_extra = 1
+        extra_page_byte_stride = 0
+        extra_topk = 0
+
     assert len(devices) == 1, f"all tensors must share a device; got {devices}"
     assert q.is_cuda
 
@@ -1337,6 +1484,23 @@ def flash_mla_with_kvcache_triton_sm120(
     kv_fp8 = k_cache.view(torch.float8_e4m3fn)
     kv_bf16 = k_cache.view(torch.bfloat16)
     kv_u8 = k_cache  # already uint8
+
+    if has_extra:
+        ekv_fp8 = extra_k_cache.view(torch.float8_e4m3fn)
+        ekv_bf16 = extra_k_cache.view(torch.bfloat16)
+        ekv_u8 = extra_k_cache
+        eindices = extra_indices_in_kvcache
+        etopk_len = extra_topk_length
+        stride_extra_idx_b = extra_indices_in_kvcache.stride(0)
+    else:
+        # Pass primary tensors as placeholders; the kernel's HAS_EXTRA=False
+        # branch never dereferences them.
+        ekv_fp8 = kv_fp8
+        ekv_bf16 = kv_bf16
+        ekv_u8 = kv_u8
+        eindices = indices
+        etopk_len = topk_length
+        stride_extra_idx_b = indices.stride(0)
 
     # Pre-allocate outputs.
     output = torch.empty((B, 1, h_q, head_dim_v), dtype=torch.bfloat16, device=q.device)
@@ -1373,12 +1537,20 @@ def flash_mla_with_kvcache_triton_sm120(
         sink_fp32,
         output,
         lse,
+        ekv_fp8,
+        ekv_bf16,
+        ekv_u8,
+        eindices,
+        etopk_len,
         softmax_scale,
         page_byte_stride,
         P,
+        extra_page_byte_stride,
+        P_extra,
         h_q,
         stride_q_b, stride_q_h,
         stride_idx_b,
+        stride_extra_idx_b,
         stride_o_b, stride_o_h,
         stride_lse_b, stride_lse_h,
         BLOCK_M=BLOCK_M,
@@ -1388,6 +1560,8 @@ def flash_mla_with_kvcache_triton_sm120(
         HEAD_DIM_QK=HEAD_DIM_QK,
         BLOCK_DV=BLOCK_DV,
         TOPK=topk,
+        EXTRA_TOPK=extra_topk,
+        HAS_EXTRA=has_extra,
         NOPE_GROUPS=7,
         GROUP_SIZE=64,
     )

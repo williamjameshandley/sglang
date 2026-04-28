@@ -106,10 +106,49 @@ def _triton_supported(
         return False
     if k_cache is None or k_cache.ndim != 4:
         return False
-    if extra_k_cache is not None:
-        return False
-    if extra_indices_in_kvcache is not None or extra_topk_length is not None:
-        return False
+    # Compressed scope: all three must be present together (Phase 6.7) or
+    # all three None (Phase 6.2 SWA-only).
+    if extra_k_cache is None:
+        if extra_indices_in_kvcache is not None or extra_topk_length is not None:
+            return False
+    else:
+        if extra_indices_in_kvcache is None or extra_topk_length is None:
+            return False
+        if extra_k_cache.ndim != 4:
+            return False
+        if extra_k_cache.shape[2] != 1 or extra_k_cache.shape[3] != 584:
+            return False
+        if extra_k_cache.dtype != torch.uint8:
+            return False
+        e_page_stride = extra_k_cache.stride(0) * extra_k_cache.element_size()
+        P_extra = extra_k_cache.shape[1]
+        if e_page_stride % 576 != 0 or e_page_stride < P_extra * 584:
+            return False
+        if extra_indices_in_kvcache.ndim != 3:
+            return False
+        if extra_indices_in_kvcache.shape[0] != q.shape[0]:
+            return False
+        if extra_indices_in_kvcache.shape[1] != 1:
+            return False
+        if extra_indices_in_kvcache.shape[-1] % 64 != 0:
+            return False
+        if extra_indices_in_kvcache.dtype != torch.int32:
+            return False
+        if extra_indices_in_kvcache.stride(2) != 1:
+            return False
+        if extra_topk_length.ndim != 1:
+            return False
+        if extra_topk_length.shape != (q.shape[0],):
+            return False
+        if extra_topk_length.dtype != torch.int32:
+            return False
+        if not (extra_k_cache.is_cuda and extra_indices_in_kvcache.is_cuda
+                and extra_topk_length.is_cuda):
+            return False
+        if not (extra_k_cache.device == q.device
+                and extra_indices_in_kvcache.device == q.device
+                and extra_topk_length.device == q.device):
+            return False
     if not (q.shape[1] == 1 and q.shape[2] % 16 == 0):
         return False
     if q.shape[3] != 512 or head_dim_v != 512:
