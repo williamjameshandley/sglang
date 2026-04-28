@@ -552,14 +552,8 @@ class C4IndexerBackend:
         elif backend is PagedMQALogitsBackend.TORCH:
             fn = fp8_paged_mqa_logits_torch
         elif backend is PagedMQALogitsBackend.TRITON_SM120:
-            # Phase 5.3.1: enum branch exists but the kernel isn't wired
-            # yet. Fall through to torch reference; the conf still sets
-            # SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 so this branch is
-            # currently unreachable. Phase 5.3.2 will replace this
-            # NotImplementedError with the real Triton kernel import.
-            raise NotImplementedError(
-                "TRITON_SM120 fp8_paged_mqa_logits kernel not yet implemented; "
-                "set SGLANG_FP8_PAGED_MQA_LOGITS_TORCH=1 until Phase 5.3.2 lands"
+            from sglang.jit_kernel.deepseek_v4 import (
+                fp8_paged_mqa_logits_triton as fn,
             )
         elif backend is PagedMQALogitsBackend.DEEP_GEMM_CHUNKED:
             from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (

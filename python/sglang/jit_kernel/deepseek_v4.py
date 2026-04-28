@@ -843,5 +843,164 @@ def compile_aot():
         pool.starmap(_compile_one, jobs)
 
 
+# ---------------------------------------------------------------------------
+# fp8_paged_mqa_logits — Triton kernel for sm_120 (CD-3)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fp8_paged_mqa_logits_kernel(
+    Q_ptr,            # [B, NUM_HEADS, HEAD_DIM] fp8 (host squeezes the 1-axis)
+    KV_ptr,           # kvcache_fp8 reinterpreted as fp8 elements (1 byte each)
+    KV_F32_ptr,       # same buffer reinterpreted as fp32 (4 bytes each)
+    W_ptr,            # [B, NUM_HEADS] fp32
+    SL_ptr,           # [B] int32
+    PT_ptr,           # [B, MAX_PAGES] int32
+    Out_ptr,          # [B, MAX_SEQ_LEN] fp32 (pre-zeroed)
+    NUM_HEADS,
+    MAX_PAGES,
+    MAX_SEQ_LEN,
+    BLOCK_SIZE: tl.constexpr,        # 64 compressed positions per page
+    HEAD_DIM: tl.constexpr,          # 128
+    NUM_HEADS_PAD: tl.constexpr,     # next pow-2 of NUM_HEADS
+    F32_PER_POS: tl.constexpr,       # (HEAD_DIM + 4) // 4 = 33
+    SCALE_F32_OFFSET: tl.constexpr,  # HEAD_DIM // 4 = 32
+    BLOCK_S: tl.constexpr,           # positions per program
+):
+    """One program covers `BLOCK_S` positions for a single batch.
+
+    Per position computes
+        score = sum_h(weight[b,h] * relu(<q[b,h], k>)) * k_scale
+    where k = kvcache fp8 vector and k_scale = the trailing fp32 scale.
+
+    KV layout: each (page, in_page) cell occupies POS_BYTES = HEAD_DIM + 4
+    bytes — first HEAD_DIM bytes are FP8 K, last 4 bytes are an FP32 scale.
+    The cache is passed twice: once as a flat fp8 view (KV_ptr) for the K
+    bytes and once as a flat fp32 view (KV_F32_ptr) for the scale fp32.
+    """
+    pid_b = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    pos_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    seq_len = tl.load(SL_ptr + pid_b)
+    in_seq = pos_offs < seq_len
+
+    page_idx = pos_offs // BLOCK_SIZE
+    in_page = pos_offs % BLOCK_SIZE
+    page_idx_clamped = tl.where(page_idx < MAX_PAGES, page_idx, 0)
+    page_id = tl.load(
+        PT_ptr + pid_b * MAX_PAGES + page_idx_clamped,
+        mask=in_seq, other=0,
+    )
+    page_id = tl.maximum(page_id, 0)
+
+    # Load Q for this batch: [NUM_HEADS_PAD, HEAD_DIM] fp8 -> fp32.
+    h_offs = tl.arange(0, NUM_HEADS_PAD)
+    h_mask = h_offs < NUM_HEADS
+    d_offs = tl.arange(0, HEAD_DIM)
+    q_offs = pid_b * NUM_HEADS * HEAD_DIM + h_offs[:, None] * HEAD_DIM + d_offs[None, :]
+    q = tl.load(Q_ptr + q_offs, mask=h_mask[:, None], other=0.0).to(tl.float32)
+
+    # Per-head weights for this batch.
+    w = tl.load(W_ptr + pid_b * NUM_HEADS + h_offs, mask=h_mask, other=0.0).to(tl.float32)
+
+    # KV byte offsets: page_id * (BLOCK_SIZE * POS_BYTES) + in_page * POS_BYTES + d.
+    POS_BYTES: tl.constexpr = 4 * F32_PER_POS  # HEAD_DIM + 4
+    base_byte = page_id[:, None] * (BLOCK_SIZE * POS_BYTES) + in_page[:, None] * POS_BYTES
+    kv_byte_offs = base_byte + d_offs[None, :]
+    kv = tl.load(KV_ptr + kv_byte_offs, mask=in_seq[:, None], other=0.0).to(tl.float32)
+
+    # Scale fp32 indices live in the same buffer reinterpreted as fp32:
+    # base_byte // 4 + SCALE_F32_OFFSET.
+    base_f32 = page_id * (BLOCK_SIZE * F32_PER_POS) + in_page * F32_PER_POS
+    scale = tl.load(KV_F32_ptr + base_f32 + SCALE_F32_OFFSET, mask=in_seq, other=0.0)
+
+    # Tensor-core dot: [BLOCK_S, HEAD_DIM] @ [HEAD_DIM, NUM_HEADS_PAD].
+    q_t = tl.trans(q)
+    dots = tl.dot(kv, q_t)
+    dots = tl.maximum(dots, 0.0)
+    dots = tl.where(h_mask[None, :], dots, 0.0)
+    weighted = dots * w[None, :]
+    head_sum = tl.sum(weighted, axis=1)
+    score = head_sum * scale
+    score = tl.where(in_seq, score, 0.0)
+
+    out_offs = pid_b * MAX_SEQ_LEN + pos_offs
+    tl.store(Out_ptr + out_offs, score, mask=pos_offs < MAX_SEQ_LEN)
+
+
+def fp8_paged_mqa_logits_triton(
+    q_fp8: torch.Tensor,
+    kvcache_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    deep_gemm_metadata: Any,
+    max_seq_len: int,
+    clean_logits: bool = False,
+) -> torch.Tensor:
+    """sm_120 Triton replacement for `deep_gemm.fp8_paged_mqa_logits`.
+
+    Shape contract matches `fp8_paged_mqa_logits_torch`
+    (`compressed/indexer.py`):
+      * input  q_fp8       [B, 1, NUM_HEADS, 128]
+      * input  kvcache_fp8 [num_pages, 64, 1, 132]
+      * input  weight      [B, NUM_HEADS] fp32
+      * input  seq_lens    [B] int32
+      * input  page_table  [B, MAX_PAGES]
+      * output             [B, max_seq_len] fp32, zero-fill past seq_lens[b]
+        and past page_table.shape[1] * 64.
+    """
+    assert clean_logits is False, "clean_logits=True not implemented"
+    _ = deep_gemm_metadata  # not consumed by Triton path
+
+    B, _, num_heads, head_dim = q_fp8.shape
+    block_size = kvcache_fp8.shape[1]
+    assert head_dim == 128
+    assert block_size == 64
+    assert kvcache_fp8.shape[1:] == (block_size, 1, head_dim + 4)
+    assert q_fp8.shape == (B, 1, num_heads, head_dim)
+    assert weight.shape == (B, num_heads)
+    assert seq_lens.shape == (B,)
+    assert page_table.shape[0] == B
+
+    F32_PER_POS = (head_dim + 4) // 4  # 33
+    SCALE_F32_OFFSET = head_dim // 4   # 32
+
+    cache_contig = kvcache_fp8.contiguous()
+    kv_fp8_flat = cache_contig.view(-1)               # FP8/uint8, byte-stride
+    kv_f32_flat = cache_contig.view(torch.float32).view(-1)  # fp32-stride view
+
+    # Pre-zero output so masked positions and the [padded_seq_len, max_seq_len)
+    # tail are zero without the kernel having to touch them.
+    scores = torch.zeros((B, max_seq_len), dtype=torch.float32, device=q_fp8.device)
+
+    max_pages = page_table.shape[1]
+    padded_seq_len = max_pages * block_size
+    BLOCK_S = 64  # one page worth of positions per program
+    NUM_HEADS_PAD = triton.next_power_of_2(num_heads)
+
+    grid = (B, triton.cdiv(padded_seq_len, BLOCK_S))
+    _fp8_paged_mqa_logits_kernel[grid](
+        q_fp8,
+        kv_fp8_flat,
+        kv_f32_flat,
+        weight,
+        seq_lens,
+        page_table,
+        scores,
+        num_heads,
+        max_pages,
+        max_seq_len,
+        BLOCK_SIZE=block_size,
+        HEAD_DIM=head_dim,
+        NUM_HEADS_PAD=NUM_HEADS_PAD,
+        F32_PER_POS=F32_PER_POS,
+        SCALE_F32_OFFSET=SCALE_F32_OFFSET,
+        BLOCK_S=BLOCK_S,
+    )
+    return scores
+
+
 if __name__ == "__main__":
     compile_aot()
