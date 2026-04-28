@@ -159,14 +159,27 @@ class HashTopK(nn.Module):
                 "HashTopK->TritonKernel conversion does not support fused "
                 "shared experts (IDs >= n_routed_experts)"
             )
+            # The helper's contract requires already-postprocessed topk_ids
+            # (no -1 sentinels, no logical-vs-physical mismatch). Padded
+            # masking and EPLB remap above already ran; if either argument
+            # was non-None these would have introduced sentinels we cannot
+            # represent. Reject loudly.
+            assert num_token_non_padded is None, (
+                "HashTopK->TritonKernel conversion does not support "
+                "padded-region masking; -1 indices in topk_ids would "
+                "corrupt the bitmatrix"
+            )
+            assert expert_location_dispatch_info is None, (
+                "HashTopK->TritonKernel conversion does not support EPLB; "
+                "router_logits columns are logical, gathering via physical "
+                "IDs would index wrong columns"
+            )
             return to_triton_kernels_format(
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 router_logits=router_logits,
                 n_expts_tot=router_logits.shape[-1],
                 n_expts_act=topk_weights.shape[-1],
-                num_token_non_padded=num_token_non_padded,
-                expert_location_dispatch_info=expert_location_dispatch_info,
             )
 
         return StandardTopKOutput(
