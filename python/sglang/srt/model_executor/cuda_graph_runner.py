@@ -180,8 +180,11 @@ class DecodeInputBuffers(ForwardInputBuffers):
             req_pool_indices = torch.zeros((max_bs,), dtype=torch.int64)
             seq_lens = torch.full((max_bs,), seq_len_fill_value, dtype=torch.int32)
             out_cache_loc = torch.zeros((max_num_token,), dtype=cache_loc_dtype)
+            # int32 to match translate_loc_from_full_to_swa's return dtype
+            # (swa_memory_pool.py:154); the comment at the replay copy site
+            # already documented the intended dtype.
             out_cache_loc_swa = (
-                torch.zeros((max_num_token,), dtype=torch.int64)
+                torch.zeros((max_num_token,), dtype=torch.int32)
                 if is_hybrid_swa
                 else None
             )
@@ -365,12 +368,26 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 srcs.append(src)
 
         # SWA cache location (int32, separate from the int64 batch above).
-        if (
-            self.out_cache_loc_swa is not None
-            and forward_batch.out_cache_loc_swa is not None
-        ):
-            dsts.append(self.out_cache_loc_swa[:raw_num_token])
-            srcs.append(forward_batch.out_cache_loc_swa[:raw_num_token])
+        # If the captured graph references self.out_cache_loc_swa (i.e. the
+        # model is hybrid-SWA / V4) but the incoming batch did not
+        # precompute one, derive it via translate_loc_from_full_to_swa so
+        # the persistent graph buffer is fresh — otherwise the captured
+        # kernel would write SWA KV to the previous replay's locations.
+        if self.out_cache_loc_swa is not None:
+            if forward_batch.out_cache_loc_swa is not None:
+                dsts.append(self.out_cache_loc_swa[:raw_num_token])
+                srcs.append(forward_batch.out_cache_loc_swa[:raw_num_token])
+            elif hasattr(
+                self.model_runner.token_to_kv_pool, "translate_loc_from_full_to_swa"
+            ):
+                translated = (
+                    self.model_runner.token_to_kv_pool
+                    .translate_loc_from_full_to_swa(
+                        forward_batch.out_cache_loc[:raw_num_token]
+                    )
+                )
+                dsts.append(self.out_cache_loc_swa[:raw_num_token])
+                srcs.append(translated)
 
         # Batch all GPU copies, grouped by dtype pair.
         _grouped_foreach_copy_(dsts, srcs)
