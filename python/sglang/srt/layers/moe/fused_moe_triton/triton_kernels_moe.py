@@ -140,6 +140,22 @@ def triton_kernel_fused_experts(
     if global_num_experts == -1:
         global_num_experts = E
 
+    # Phase3 diag: localize the matmul_ogs OOB hypothesis. Reviewer flagged
+    # potential shard mismatch between RoutingData.n_expts_tot (built from
+    # the full logical router_logits.shape[-1]) and w1.shape[0] (rank-local
+    # weight tensor). Print actual values once per dispatch so we can
+    # confirm. Env-gated to keep noise out of normal runs.
+    import os as _os
+    if _os.environ.get("SGLANG_PHASE3_TRACE_MOE"):
+        print(
+            f"[phase3-moe] M={M} K={K} E={E} N={N} n_expts_act={n_expts_act} "
+            f"routing_data.n_expts_tot={routing_data.n_expts_tot} "
+            f"routing_data.n_expts_act={routing_data.n_expts_act} "
+            f"w1.shape={tuple(w1.shape)} "
+            f"hist.shape={tuple(routing_data.expt_hist.shape) if routing_data.expt_hist is not None else None}",
+            flush=True,
+        )
+
     # consistent with default implementation
     intermediate_cache2 = torch.empty(
         (M * n_expts_act, N // 2), device="cuda", dtype=dtype
