@@ -404,8 +404,9 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                 # partial GEMM accumulate
                 #
                 # See note above on the equivalent T.gemm call: TileLang
-                # 0.1.9 internalised the synchronous wait that the
-                # original `wg_wait=0` requested.
+                # 0.1.9 removed the public `wg_wait` kwarg; the previous
+                # value was `wg_wait=0`, so this call still uses
+                # synchronous dependency ordering.
                 T.gemm(
                     x_f,
                     fn_smem,
