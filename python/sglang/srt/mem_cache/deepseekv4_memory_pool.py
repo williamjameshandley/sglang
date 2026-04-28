@@ -889,17 +889,6 @@ class DeepSeekV4TokenToKVPool(KVCache):
     # - PagedTokenToKVAllocator
 
 
-def _free_valid(allocator, indices: Optional[torch.Tensor]) -> None:
-    """Free indices on a paged allocator, skipping slot 0 (the reserved
-    padded-output slot per allocator.py:116-119, 452-455). Used for
-    rolling back partial composite allocations."""
-    if indices is None:
-        return
-    valid = indices[indices > 0]
-    if valid.numel() > 0:
-        allocator.free(valid)
-
-
 class DeepSeekV4TokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     """V4-aware allocator that owns separate full and SWA paged allocators
     plus the `full_to_swa_index_mapping` consumed by
@@ -1056,6 +1045,13 @@ class DeepSeekV4TokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
+        # Snapshot inner free-list state so a partial-failure rollback is
+        # exact: paged alloc_extend returns token indices that include
+        # last_loc+1 in an already-allocated page, so freeing the returned
+        # tensor would double-free the existing partial-prefix page.
+        full_state = self.full_attn_allocator.backup_state()
+        swa_state = self.swa_attn_allocator.backup_state()
+
         alloc_full_indices = self.full_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -1074,8 +1070,8 @@ class DeepSeekV4TokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
         if alloc_full_indices is None or alloc_swa_indices is None:
-            _free_valid(self.full_attn_allocator, alloc_full_indices)
-            _free_valid(self.swa_attn_allocator, alloc_swa_indices)
+            self.full_attn_allocator.restore_state(full_state)
+            self.swa_attn_allocator.restore_state(swa_state)
             return None
 
         self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
@@ -1089,6 +1085,9 @@ class DeepSeekV4TokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
     ):
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
 
+        full_state = self.full_attn_allocator.backup_state()
+        swa_state = self.swa_attn_allocator.backup_state()
+
         alloc_full_indices = self.full_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
         )
@@ -1097,8 +1096,8 @@ class DeepSeekV4TokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         )
 
         if alloc_full_indices is None or alloc_swa_indices is None:
-            _free_valid(self.full_attn_allocator, alloc_full_indices)
-            _free_valid(self.swa_attn_allocator, alloc_swa_indices)
+            self.full_attn_allocator.restore_state(full_state)
+            self.swa_attn_allocator.restore_state(swa_state)
             return None
 
         self.full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
