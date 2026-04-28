@@ -540,18 +540,6 @@ class FusedMoE(torch.nn.Module):
                     self.quant_config, "load_transposed", True
                 ):
                     loaded_weight = loaded_weight.transpose(-2, -1)
-                import os as _os
-                if _os.environ.get("SGLANG_PHASE3_TRACE", "0") == "1":
-                    import logging as _logging
-                    _logging.getLogger(__name__).info(
-                        "[phase3-trace] _load_w2: "
-                        f"expert_data.shape={tuple(expert_data.shape)} "
-                        f"loaded_weight.shape={tuple(loaded_weight.shape)} "
-                        f"shard_dim={shard_dim} shard_size={shard_size} "
-                        f"tp_rank={tp_rank} "
-                        f"use_triton_kernels={self.use_triton_kernels} "
-                        f"load_transposed={getattr(self.quant_config, 'load_transposed', '<missing>')}"
-                    )
                 loaded_weight = loaded_weight.narrow(
                     shard_dim, shard_size * tp_rank, shard_size
                 )
