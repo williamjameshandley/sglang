@@ -850,9 +850,9 @@ def compile_aot():
 
 @triton.jit
 def _fp8_paged_mqa_logits_kernel(
-    Q_ptr,            # [B, NUM_HEADS, HEAD_DIM] fp8 (host squeezes the 1-axis)
-    KV_ptr,           # kvcache_fp8 reinterpreted as fp8 elements (1 byte each)
-    KV_F32_ptr,       # same buffer reinterpreted as fp32 (4 bytes each)
+    Q_ptr,            # [B, NUM_HEADS, HEAD_DIM] fp8
+    KV_ptr,           # kvcache reinterpreted as fp8 elements
+    KV_F32_ptr,       # same buffer reinterpreted as fp32
     W_ptr,            # [B, NUM_HEADS] fp32
     SL_ptr,           # [B] int32
     PT_ptr,           # [B, MAX_PAGES] int32
@@ -860,23 +860,28 @@ def _fp8_paged_mqa_logits_kernel(
     NUM_HEADS,
     MAX_PAGES,
     MAX_SEQ_LEN,
-    BLOCK_SIZE: tl.constexpr,        # 64 compressed positions per page
-    HEAD_DIM: tl.constexpr,          # 128
-    NUM_HEADS_PAD: tl.constexpr,     # next pow-2 of NUM_HEADS
-    F32_PER_POS: tl.constexpr,       # (HEAD_DIM + 4) // 4 = 33
-    SCALE_F32_OFFSET: tl.constexpr,  # HEAD_DIM // 4 = 32
-    BLOCK_S: tl.constexpr,           # positions per program
+    BLOCK_SIZE: tl.constexpr,           # 64 compressed positions per page
+    HEAD_DIM: tl.constexpr,             # 128
+    NUM_HEADS_PAD: tl.constexpr,        # next pow-2 of NUM_HEADS
+    PAGE_BYTES: tl.constexpr,           # BLOCK_SIZE * (HEAD_DIM + 4)
+    K_BYTES_PER_PAGE: tl.constexpr,     # BLOCK_SIZE * HEAD_DIM
+    PAGE_F32: tl.constexpr,             # PAGE_BYTES // 4
+    SCALE_F32_BASE: tl.constexpr,       # K_BYTES_PER_PAGE // 4
+    BLOCK_S: tl.constexpr,              # positions per program
 ):
     """One program covers `BLOCK_S` positions for a single batch.
 
     Per position computes
-        score = sum_h(weight[b,h] * relu(<q[b,h], k>)) * k_scale
-    where k = kvcache fp8 vector and k_scale = the trailing fp32 scale.
+        score = sum_h(weight[b,h] * relu(<q[b,h], k>)) * k_scale.
 
-    KV layout: each (page, in_page) cell occupies POS_BYTES = HEAD_DIM + 4
-    bytes — first HEAD_DIM bytes are FP8 K, last 4 bytes are an FP32 scale.
-    The cache is passed twice: once as a flat fp8 view (KV_ptr) for the K
-    bytes and once as a flat fp32 view (KV_F32_ptr) for the scale fp32.
+    KV layout (per page, matching `fp8_paged_mqa_logits_torch` at
+    `compressed/indexer.py:68-84`):
+      [BLOCK_SIZE * HEAD_DIM bytes of FP8 K] then
+      [BLOCK_SIZE * 4 bytes of FP32 scale],
+    not interleaved per position.
+
+      K   byte offset = page * PAGE_BYTES + in_page * HEAD_DIM + d
+      scl fp32 index  = page * PAGE_F32   + SCALE_F32_BASE + in_page
     """
     pid_b = tl.program_id(0)
     pid_s = tl.program_id(1)
@@ -894,26 +899,25 @@ def _fp8_paged_mqa_logits_kernel(
     )
     page_id = tl.maximum(page_id, 0)
 
-    # Load Q for this batch: [NUM_HEADS_PAD, HEAD_DIM] fp8 -> fp32.
     h_offs = tl.arange(0, NUM_HEADS_PAD)
     h_mask = h_offs < NUM_HEADS
     d_offs = tl.arange(0, HEAD_DIM)
     q_offs = pid_b * NUM_HEADS * HEAD_DIM + h_offs[:, None] * HEAD_DIM + d_offs[None, :]
     q = tl.load(Q_ptr + q_offs, mask=h_mask[:, None], other=0.0).to(tl.float32)
 
-    # Per-head weights for this batch.
     w = tl.load(W_ptr + pid_b * NUM_HEADS + h_offs, mask=h_mask, other=0.0).to(tl.float32)
 
-    # KV byte offsets: page_id * (BLOCK_SIZE * POS_BYTES) + in_page * POS_BYTES + d.
-    POS_BYTES: tl.constexpr = 4 * F32_PER_POS  # HEAD_DIM + 4
-    base_byte = page_id[:, None] * (BLOCK_SIZE * POS_BYTES) + in_page[:, None] * POS_BYTES
-    kv_byte_offs = base_byte + d_offs[None, :]
+    # K byte offsets: split layout — all-K then all-scale per page.
+    kv_byte_offs = (
+        page_id[:, None] * PAGE_BYTES
+        + in_page[:, None] * HEAD_DIM
+        + d_offs[None, :]
+    )
     kv = tl.load(KV_ptr + kv_byte_offs, mask=in_seq[:, None], other=0.0).to(tl.float32)
 
-    # Scale fp32 indices live in the same buffer reinterpreted as fp32:
-    # base_byte // 4 + SCALE_F32_OFFSET.
-    base_f32 = page_id * (BLOCK_SIZE * F32_PER_POS) + in_page * F32_PER_POS
-    scale = tl.load(KV_F32_ptr + base_f32 + SCALE_F32_OFFSET, mask=in_seq, other=0.0)
+    # Scale fp32 indices: page * PAGE_F32 + SCALE_F32_BASE + in_page.
+    scale_idx = page_id * PAGE_F32 + SCALE_F32_BASE + in_page
+    scale = tl.load(KV_F32_ptr + scale_idx, mask=in_seq, other=0.0)
 
     # Tensor-core dot: [BLOCK_S, HEAD_DIM] @ [HEAD_DIM, NUM_HEADS_PAD].
     q_t = tl.trans(q)
@@ -964,12 +968,20 @@ def fp8_paged_mqa_logits_triton(
     assert seq_lens.shape == (B,)
     assert page_table.shape[0] == B
 
-    F32_PER_POS = (head_dim + 4) // 4  # 33
-    SCALE_F32_OFFSET = head_dim // 4   # 32
+    PAGE_BYTES = block_size * (head_dim + 4)        # 8448 for the V4 layout
+    K_BYTES_PER_PAGE = block_size * head_dim        # 8192
+    PAGE_F32 = PAGE_BYTES // 4                      # 2112
+    SCALE_F32_BASE = K_BYTES_PER_PAGE // 4          # 2048
 
     cache_contig = kvcache_fp8.contiguous()
-    kv_fp8_flat = cache_contig.view(-1)               # FP8/uint8, byte-stride
-    kv_f32_flat = cache_contig.view(torch.float32).view(-1)  # fp32-stride view
+    # Reinterpret cache bytes as FP8 (for K loads) and fp32 (for scale).
+    # The torch reference at compressed/indexer.py:78 does the same view; the
+    # underlying storage is byte-aligned, so both views are valid no-ops if
+    # cache_contig is already FP8 / uint8. This Triton path is only entered on
+    # CUDA sm_120 (the HIP fnuz case routes to TORCH in paged_mqa_backend.py),
+    # so torch.float8_e4m3fn is the right typed view.
+    kv_fp8_flat = cache_contig.view(torch.float8_e4m3fn).view(-1)
+    kv_f32_flat = cache_contig.view(torch.float32).view(-1)
 
     # Pre-zero output so masked positions and the [padded_seq_len, max_seq_len)
     # tail are zero without the kernel having to touch them.
@@ -977,7 +989,7 @@ def fp8_paged_mqa_logits_triton(
 
     max_pages = page_table.shape[1]
     padded_seq_len = max_pages * block_size
-    BLOCK_S = 64  # one page worth of positions per program
+    BLOCK_S = 64
     NUM_HEADS_PAD = triton.next_power_of_2(num_heads)
 
     grid = (B, triton.cdiv(padded_seq_len, BLOCK_S))
@@ -995,8 +1007,10 @@ def fp8_paged_mqa_logits_triton(
         BLOCK_SIZE=block_size,
         HEAD_DIM=head_dim,
         NUM_HEADS_PAD=NUM_HEADS_PAD,
-        F32_PER_POS=F32_PER_POS,
-        SCALE_F32_OFFSET=SCALE_F32_OFFSET,
+        PAGE_BYTES=PAGE_BYTES,
+        K_BYTES_PER_PAGE=K_BYTES_PER_PAGE,
+        PAGE_F32=PAGE_F32,
+        SCALE_F32_BASE=SCALE_F32_BASE,
         BLOCK_S=BLOCK_S,
     )
     return scores
