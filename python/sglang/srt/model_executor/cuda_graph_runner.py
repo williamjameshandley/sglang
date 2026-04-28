@@ -287,10 +287,13 @@ class DecodeInputBuffers(ForwardInputBuffers):
         nsa_enable_prefill_cp: bool,
         enable_num_token_non_padded_flag: bool,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
+        token_to_kv_pool=None,
     ):
         if bs != raw_bs:
             self.seq_lens.fill_(seq_len_fill_value)
             self.out_cache_loc.zero_()
+            if self.out_cache_loc_swa is not None:
+                self.out_cache_loc_swa.zero_()
             if self.mamba_track_indices is not None:
                 self.mamba_track_indices.zero_()
             if self.mamba_track_mask is not None:
@@ -377,14 +380,16 @@ class DecodeInputBuffers(ForwardInputBuffers):
             if forward_batch.out_cache_loc_swa is not None:
                 dsts.append(self.out_cache_loc_swa[:raw_num_token])
                 srcs.append(forward_batch.out_cache_loc_swa[:raw_num_token])
-            elif hasattr(
-                self.model_runner.token_to_kv_pool, "translate_loc_from_full_to_swa"
-            ):
-                translated = (
-                    self.model_runner.token_to_kv_pool
-                    .translate_loc_from_full_to_swa(
-                        forward_batch.out_cache_loc[:raw_num_token]
-                    )
+            else:
+                assert token_to_kv_pool is not None and hasattr(
+                    token_to_kv_pool, "translate_loc_from_full_to_swa"
+                ), (
+                    "CUDA graph replay for hybrid SWA requires either "
+                    "forward_batch.out_cache_loc_swa or a pool exposing "
+                    "translate_loc_from_full_to_swa"
+                )
+                translated = token_to_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc[:raw_num_token]
                 )
                 dsts.append(self.out_cache_loc_swa[:raw_num_token])
                 srcs.append(translated)
@@ -1272,6 +1277,7 @@ class CudaGraphRunner:
                 self.model_runner.server_args
             ),
             pp_proxy_tensors=pp_proxy_tensors,
+            token_to_kv_pool=self.model_runner.token_to_kv_pool,
         )
 
         if (
