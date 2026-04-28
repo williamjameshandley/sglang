@@ -1017,8 +1017,17 @@ def fp8_paged_mqa_logits_triton(
 
 
 # ---------------------------------------------------------------------------
-# Sparse MLA decode — Triton kernel for sm_120 (Phase 6.2)
+# Sparse MLA decode — Triton kernel for sm_120 (Phase 6.2 / 6.7)
 # ---------------------------------------------------------------------------
+
+# Module-global set of (has_extra, topk, extra_topk) specs that have launched
+# the Triton kernel outside CUDA graph capture (and therefore been JIT-compiled).
+# Phase 6.11 capture-safety: any spec entering capture without an entry here is
+# guaranteed to invalidate the stream when Triton compiles its first kernel
+# inside the captured region. The wrapper raises a clear Python error in that
+# case instead of letting CUDA report cudaErrorStreamCaptureInvalidated at
+# capture_end.
+_SPARSE_MLA_WARMED_SPECS: set = set()
 
 
 @triton.jit
@@ -1523,8 +1532,35 @@ def flash_mla_with_kvcache_triton_sm120(
     BLOCK_DV = 128
     assert HEAD_DIM_QK % BLOCK_DV == 0
 
-    # Cast attn_sink to fp32 for stable epilogue arithmetic.
-    sink_fp32 = attn_sink.to(torch.float32)
+    # The kernel reads attn_sink and upcasts to fp32 internally
+    # (`tl.load(Sink_ptr).to(tl.float32)`), so we don't need to allocate
+    # an fp32 tensor here. Allocating inside the captured forward used to
+    # add a per-layer aten::_to_copy op that was a needless alloc/copy.
+    sink = attn_sink
+
+    # Spec-tracking guard. CUDA graph capture cannot handle a Triton
+    # specialization that hits its first JIT-compile inside capture (it
+    # invalidates the stream). If the spec wasn't pre-warmed, fail with a
+    # clear Python error instead of the opaque cudaErrorStreamCaptureInvalidated
+    # at capture_end. The set is module-global; repeated launches don't
+    # rebuild it.
+    spec = (
+        bool(has_extra),
+        int(topk),
+        int(extra_topk),
+        # h_q controls grid Y but not constexpr, so excluded.
+    )
+    if torch.cuda.is_current_stream_capturing():
+        if spec not in _SPARSE_MLA_WARMED_SPECS:
+            raise RuntimeError(
+                f"sparse_mla_triton_sm120: spec {spec} hit CUDA graph capture "
+                f"without prior warmup. Known warmed specs: "
+                f"{sorted(_SPARSE_MLA_WARMED_SPECS)}. "
+                f"Pre-launch this spec outside capture to JIT-compile the "
+                f"Triton kernel before it is recorded."
+            )
+    else:
+        _SPARSE_MLA_WARMED_SPECS.add(spec)
 
     grid = (B, h_q // BLOCK_M, HEAD_DIM_QK // BLOCK_DV)
     _sparse_mla_decode_kernel[grid](
@@ -1534,7 +1570,7 @@ def flash_mla_with_kvcache_triton_sm120(
         kv_u8,
         indices,
         topk_length,
-        sink_fp32,
+        sink,
         output,
         lse,
         ekv_fp8,
