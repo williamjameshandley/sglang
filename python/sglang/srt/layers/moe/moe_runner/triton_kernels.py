@@ -108,6 +108,27 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
         )
 
         has_bias = quant_info.w13_bias is not None or quant_info.w2_bias is not None
+        # MXFP4 routed-expert weights need a precision_config to inform
+        # matmul_ogs about the e8m0 group-32 scales and packed layout.
+        # Both the bias and no-bias entrypoints now plumb precision_config
+        # through; pick by bias presence, not by precision-config presence.
+        # Note: the bias variant computes `silu(gate) * (up + 1)` (GPT-OSS-
+        # specific gated MLP with a +1 term tied to the bias path); the
+        # no-bias variant computes standard `silu(gate) * up`. V4-Flash uses
+        # standard SwiGLU and biasless routed experts, so it routes through
+        # the no-bias path with precision_config plumbed.
+        has_pcg = (
+            quant_info.w13_precision_config is not None
+            or quant_info.w2_precision_config is not None
+        )
+        if has_pcg:
+            assert (
+                quant_info.w13_precision_config is not None
+                and quant_info.w2_precision_config is not None
+            ), (
+                "Precision-config execution requires both "
+                "w13_precision_config and w2_precision_config"
+            )
 
         if has_bias:
             assert (
@@ -130,6 +151,8 @@ class TritonKernelsRunnerCore(MoeRunnerCore):
                 hidden_states=hidden_states,
                 w1=quant_info.w13_weight,
                 w2=quant_info.w2_weight,
+                w1_pcg=quant_info.w13_precision_config,
+                w2_pcg=quant_info.w2_precision_config,
                 **common_kwargs,
             )
 

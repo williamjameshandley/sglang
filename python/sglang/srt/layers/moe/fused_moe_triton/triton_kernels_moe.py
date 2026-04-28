@@ -99,6 +99,8 @@ def triton_kernel_fused_experts(
     a1_scale: Optional[torch.Tensor] = None,
     a2_scale: Optional[torch.Tensor] = None,
     block_shape: Optional[list[int]] = None,
+    w1_pcg=None,
+    w2_pcg=None,
 ) -> torch.Tensor:
 
     assert use_fp8_w8a8 is False, "use_fp8_w8a8 is not supported"
@@ -112,8 +114,11 @@ def triton_kernel_fused_experts(
 
     # type check
     assert hidden_states.dtype == torch.bfloat16, "hidden_states must be bfloat16"
-    assert w1.dtype == torch.bfloat16, "w1 must be bfloat16"
-    assert w2.dtype == torch.bfloat16, "w2 must be bfloat16"
+    for w in (w1, w2):
+        # TODO assert bf16 or mxfp4 (mirrors `_with_bias` variant — when a
+        # PrecisionConfig is supplied via w1_pcg/w2_pcg, weights may be the
+        # MXFP4-packed wrapped Tensor produced by `_swizzle_mxfp4`).
+        pass
 
     # Shape check
     assert hidden_states.ndim == 2, "hidden_states must be 2D"
@@ -146,6 +151,7 @@ def triton_kernel_fused_experts(
         None,
         routing_data,
         gather_indx=gather_indx,
+        precision_config=w1_pcg,
         gammas=routing_data.gate_scal if apply_router_weight_on_input else None,
     )
 
@@ -162,6 +168,7 @@ def triton_kernel_fused_experts(
         None,
         routing_data,
         scatter_indx=scatter_indx,
+        precision_config=w2_pcg,
         gammas=None if apply_router_weight_on_input else routing_data.gate_scal,
     )
 
