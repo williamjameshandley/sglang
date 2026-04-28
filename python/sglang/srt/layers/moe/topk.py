@@ -33,11 +33,14 @@ import torch.nn.functional as F
 
 try:
     # triton_kernels v3.6.0 moved RoutingData/GatherIndx/ScatterIndx from
-    # the dropped `routing` submodule into `matmul_ogs`, replaced
+    # the dropped `routing` submodule into `matmul_ogs`, and replaced
     # `routing_from_bitmatrix` with constructing RoutingData via
-    # `make_ragged_tensor_metadata` over a `SparseMatrix.mask_metadata`,
-    # and replaced the pow-2-only `tl.arange(0, N_EXPTS_ACT)` with the
-    # native `tl.topk` so non-pow-2 top-k values work without padding.
+    # `make_ragged_tensor_metadata` over a `SparseMatrix.mask_metadata`.
+    # The pow-2-only `tl.arange(0, N_EXPTS_ACT)` constraint was relaxed in
+    # `streaming_topk` (now `tl.topk`) but `_topk_forward.py:114` still
+    # uses `tl.arange(0, N_EXPTS_ACT)` for the gather step, so callers
+    # must pad `N_EXPTS_ACT` to a power of two before passing
+    # caller-provided `y_indx`. See `to_triton_kernels_format`.
     from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
     from triton_kernels.tensor import (
         SparseMatrix,
@@ -273,11 +276,12 @@ def to_triton_kernels_format(
 ) -> "TritonKernelTopKOutput":
     """Build a TritonKernelTopKOutput from already-postprocessed topk_weights/ids.
 
-    Uses triton_kernels v3.6.0's native `topk` (which handles arbitrary
-    non-pow-2 k via `tl.topk` rather than v3.5.1's `tl.arange(0, k)`-bound
-    pattern) to compute the SparseMatrix and bitmatrix metadata, then
-    constructs RoutingData / GatherIndx / ScatterIndx in the canonical
-    way described in `triton_kernels/tests/test_matmul.py:init_routing_data`.
+    Uses triton_kernels v3.6.0's `topk` to compute the SparseMatrix
+    and bitmatrix metadata, then constructs RoutingData / GatherIndx
+    / ScatterIndx in the canonical way described in
+    `triton_kernels/tests/test_matmul.py:init_routing_data`. The
+    `_topk_forward` kernel still requires `N_EXPTS_ACT` be a power of
+    two, so we pad below before invoking it.
 
     Re-uses the caller's `topk_ids` (via `y_indx`) so V4-Flash's noaux_tc /
     biased_grouped_topk scoring is preserved through to RoutingData; the
@@ -486,12 +490,11 @@ class TopK(MultiPlatformOp):
             output_format = TopKOutputFormat.STANDARD
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
-            # triton_kernels v3.6.0's `topk` handles arbitrary (non-pow-2)
-            # k natively, so the v3.5.1 pow-2 fast path is no longer
-            # needed. We always delegate to `select_experts` (which honors
-            # the full TopKConfig — noaux_tc, biased_grouped_topk, EPLB
-            # remap, padded masking, etc.) and convert its
-            # StandardTopKOutput to a TritonKernelTopKOutput.
+            # Delegate to `select_experts` (which honors the full TopKConfig
+            # — noaux_tc, biased_grouped_topk, EPLB remap, padded masking,
+            # etc.) and convert its StandardTopKOutput to a
+            # TritonKernelTopKOutput. `to_triton_kernels_format` pads
+            # n_expts_act to a power of two for the `_topk_forward` kernel.
             #
             # to_triton_kernels_format cannot represent fused shared
             # expert IDs >= n_routed_experts; guard that here.
