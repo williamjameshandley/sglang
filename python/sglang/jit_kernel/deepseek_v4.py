@@ -1028,6 +1028,7 @@ def fp8_paged_mqa_logits_triton(
 # case instead of letting CUDA report cudaErrorStreamCaptureInvalidated at
 # capture_end.
 _SPARSE_MLA_WARMED_SPECS: set = set()
+_SPARSE_MLA_DEBUG_LOGGED: dict = {}
 
 
 @triton.jit
@@ -1550,7 +1551,19 @@ def flash_mla_with_kvcache_triton_sm120(
         int(extra_topk),
         # h_q controls grid Y but not constexpr, so excluded.
     )
-    if torch.cuda.is_current_stream_capturing():
+    capturing = torch.cuda.is_current_stream_capturing()
+    if not _SPARSE_MLA_DEBUG_LOGGED.get(spec):
+        # One-time-per-spec log: confirms whether this wrapper is reached
+        # during warmup and during capture, and whether the spec was warmed.
+        import sys
+        sys.stderr.write(
+            f"[sparse_mla_triton_sm120] spec={spec} capturing={capturing} "
+            f"warmed_already={spec in _SPARSE_MLA_WARMED_SPECS} "
+            f"all_warmed={sorted(_SPARSE_MLA_WARMED_SPECS)}\n"
+        )
+        sys.stderr.flush()
+        _SPARSE_MLA_DEBUG_LOGGED[spec] = True
+    if capturing:
         if spec not in _SPARSE_MLA_WARMED_SPECS:
             raise RuntimeError(
                 f"sparse_mla_triton_sm120: spec {spec} hit CUDA graph capture "
