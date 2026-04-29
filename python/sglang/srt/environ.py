@@ -560,6 +560,9 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    # Tri-state: None → auto (use Triton on sm_120, TileLang elsewhere).
+    # True/False overrides.
+    SGLANG_OPT_USE_TRITON_MHC = EnvBool(None)
     SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(True)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")
     SGLANG_FLASHMLA_BACKEND = EnvStr(None)

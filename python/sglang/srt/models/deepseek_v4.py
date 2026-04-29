@@ -1754,6 +1754,31 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.rms_norm_eps = config.rms_norm_eps
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
+        # Resolve MHC backend at layer-init time so the captured forward
+        # contains no env reads or inline imports (Dynamo-traced PCG must
+        # not see TileLang's `inspect.getsourcelines()` introspection).
+        # Tri-state: True/False explicit, None → auto (Triton on sm_120).
+        triton_choice = envs.SGLANG_OPT_USE_TRITON_MHC.get()
+        if triton_choice is None:
+            try:
+                _major, _ = torch.cuda.get_device_capability()
+                _use_triton_mhc = (_major == 12)  # sm_120 desktop Blackwell
+            except Exception:
+                _use_triton_mhc = False
+        else:
+            _use_triton_mhc = bool(triton_choice)
+
+        if _use_triton_mhc:
+            from sglang.jit_kernel.mhc_triton import (
+                mhc_post_triton_full,
+                mhc_pre_triton,
+            )
+            self._mhc_pre_fn = mhc_pre_triton
+            self._mhc_post_fn = mhc_post_triton_full
+        else:
+            self._mhc_pre_fn = None  # legacy paths resolved inline below
+            self._mhc_post_fn = None
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         if envs.SGLANG_DSV4_MODE.get() == "2604":
             first_k_dense_replace = 0
@@ -1794,6 +1819,22 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, self.hc_mult), dtype=dtype, device=x.device
             )
             return y, post, comb
+
+        if self._mhc_pre_fn is not None:
+            # Bound at __init__ time; captured forward sees no env reads
+            # or inline imports (PCG / Dynamo compatibility).
+            post, comb, y = self._mhc_pre_fn(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=2.0,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+            )
+            return y, post.squeeze(-1), comb
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
@@ -1861,6 +1902,9 @@ class DeepseekV4DecoderLayer(nn.Module):
             return torch.empty(
                 (0, self.hc_mult, x.shape[-1]), dtype=x.dtype, device=x.device
             )
+
+        if self._mhc_post_fn is not None:
+            return self._mhc_post_fn(x, residual, post, comb)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.srt.layers.mhc import mhc_post
