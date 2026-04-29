@@ -352,6 +352,30 @@ def fused_norm_rope_inplace(
     )
 
 
+from sglang.srt.utils.custom_op import register_custom_op
+
+
+@register_custom_op(op_name="deepseek_v4_fused_rope_q_", mutates_args=["q"])
+def _fused_rope_q_(
+    q: torch.Tensor,
+    freqs_real: torch.Tensor,
+    positions: torch.Tensor,
+    inverse: bool,
+) -> None:
+    _jit_fused_rope_module().forward(q, None, freqs_real, positions, inverse)
+
+
+@register_custom_op(op_name="deepseek_v4_fused_rope_qk_", mutates_args=["q", "k"])
+def _fused_rope_qk_(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_real: torch.Tensor,
+    positions: torch.Tensor,
+    inverse: bool,
+) -> None:
+    _jit_fused_rope_module().forward(q, k, freqs_real, positions, inverse)
+
+
 def fused_rope(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
@@ -379,8 +403,10 @@ def fused_rope(
         return
 
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
-    module = _jit_fused_rope_module()
-    module.forward(q, k, freqs_real, positions, inverse)
+    if k is None:
+        _fused_rope_q_(q, freqs_real, positions, inverse)
+    else:
+        _fused_rope_qk_(q, k, freqs_real, positions, inverse)
 
 
 @cache_once
