@@ -217,7 +217,13 @@ class PiecewiseCudaGraphRunner:
                 (self.max_num_tokens,), dtype=self._cache_loc_dtype()
             )
             out_cache_loc_swa = (
-                torch.zeros((self.max_num_tokens,), dtype=torch.int64)
+                # int32 to match `translate_loc_from_full_to_swa`'s return
+                # dtype (swa_memory_pool.py:154) and the regular CUDA graph
+                # runner's allocation at cuda_graph_runner.py:186 (fixed in
+                # Phase 5.5). The shared `_forward_input_buffer_pool` asserts
+                # consistent dtype between the two graph runners, so they
+                # must agree.
+                torch.zeros((self.max_num_tokens,), dtype=torch.int32)
                 if model_runner.is_hybrid_swa
                 else None
             )
