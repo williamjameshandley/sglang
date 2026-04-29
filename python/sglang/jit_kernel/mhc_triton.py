@@ -387,3 +387,140 @@ def mhc_pre_gemm_sqrsum_triton(
     )
 
     return out, sqrsum
+
+
+@triton.jit
+def _mhc_post_kernel(
+    A_ptr,        # [n, hc, hc] fp32  (comb_res_mix)
+    B_ptr,        # [n, hc, h]  bf16  (residual)
+    C_ptr,        # [n, hc]     fp32  (post_layer_mix)
+    D_ptr,        # [n, h]      bf16  (attention output x)
+    Out_ptr,      # [n, hc, h]  bf16
+    n_tokens,
+    stride_a_n, stride_a_co, stride_a_ci,
+    stride_b_n, stride_b_c, stride_b_h,
+    stride_c_n, stride_c_c,
+    stride_d_n, stride_d_h,
+    stride_o_n, stride_o_c, stride_o_h,
+    HC: tl.constexpr,           # padded power-of-2; mask via HC_REAL
+    HC_REAL: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    H_BLOCK: tl.constexpr,
+):
+    """One program per (token, hidden tile). Each program loads
+    a[t]: [HC, HC], c[t]: [HC], and a tile of b[t]: [HC, H_BLOCK]
+    and d[t]: [H_BLOCK]; computes
+        out[i, j] = c[i] * d[j] + sum_k a[k, i] * b[k, j]
+    in fp32, casts to bf16, stores.
+    """
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    co = tl.arange(0, HC)
+    ci = tl.arange(0, HC)
+    co_mask = co < HC_REAL
+    ci_mask = ci < HC_REAL
+
+    h_offs = pid_h * H_BLOCK + tl.arange(0, H_BLOCK)
+    h_mask = h_offs < HIDDEN
+
+    # Load a [HC, HC] fp32 (rows beyond HC_REAL = 0 via mask)
+    a_ptrs = (A_ptr + pid_t * stride_a_n
+              + ci[:, None] * stride_a_ci
+              + co[None, :] * stride_a_co)
+    a_tile = tl.load(a_ptrs, mask=ci_mask[:, None] & co_mask[None, :], other=0.0)
+
+    # Load c [HC] fp32
+    c_ptrs = C_ptr + pid_t * stride_c_n + co * stride_c_c
+    c_tile = tl.load(c_ptrs, mask=co_mask, other=0.0)
+
+    # Load b [HC, H_BLOCK] bf16 -> fp32
+    b_ptrs = (B_ptr + pid_t * stride_b_n
+              + ci[:, None] * stride_b_c
+              + h_offs[None, :] * stride_b_h)
+    b_tile = tl.load(b_ptrs,
+                     mask=ci_mask[:, None] & h_mask[None, :],
+                     other=0.0).to(tl.float32)
+
+    # Load d [H_BLOCK] bf16 -> fp32
+    d_ptrs = D_ptr + pid_t * stride_d_n + h_offs * stride_d_h
+    d_tile = tl.load(d_ptrs, mask=h_mask, other=0.0).to(tl.float32)
+
+    # out[co, h] = c[co] * d[h] + sum_ci a[ci, co] * b[ci, h]
+    # = (c[:, None] * d[None, :]) + (a.T @ b)
+    cd = c_tile[:, None] * d_tile[None, :]                             # [HC, H_BLOCK]
+    # a is [HC_ci, HC_co]; want sum over ci of a[ci, co] * b[ci, h]
+    # tl.dot expects 2D-2D bf16/fp32. Cast a to bf16 to use tensor cores.
+    a_bf = a_tile.to(tl.bfloat16)
+    b_bf = b_tile.to(tl.bfloat16)
+    ab = tl.dot(tl.trans(a_bf), b_bf, out_dtype=tl.float32)            # [HC_co, H_BLOCK]
+
+    out_tile = (cd + ab).to(tl.bfloat16)
+
+    o_ptrs = (Out_ptr + pid_t * stride_o_n
+              + co[:, None] * stride_o_c
+              + h_offs[None, :] * stride_o_h)
+    tl.store(o_ptrs, out_tile, mask=co_mask[:, None] & h_mask[None, :])
+
+
+def mhc_post_triton(
+    x: torch.Tensor,                # [n, h] bf16  (attention output)
+    residual: torch.Tensor,         # [n, hc, h] bf16
+    post_layer_mix: torch.Tensor,   # [n, hc] or [n, hc, 1] fp32
+    comb_res_mix: torch.Tensor,     # [n, hc, hc] fp32
+) -> torch.Tensor:
+    """Triton replacement for `mhc_post_tilelang`.
+
+    Computes per-token, per-head, per-position:
+        out[i, c, j] = post[i, c] * x[i, j]
+                     + sum_k comb[i, k, c] * residual[i, k, j]
+
+    Returns `[n, hc, h]` bf16 matching the existing torch fallback at
+    `models/deepseek_v4.py:1875-1880`.
+    """
+    if post_layer_mix.dim() == 3 and post_layer_mix.shape[-1] == 1:
+        post_layer_mix = post_layer_mix.squeeze(-1)
+
+    assert x.dim() == 2 and residual.dim() == 3
+    n, hidden = x.shape
+    assert residual.shape[0] == n and residual.shape[2] == hidden
+    hc = residual.shape[1]
+    assert post_layer_mix.shape == (n, hc)
+    assert comb_res_mix.shape == (n, hc, hc)
+    assert x.dtype == torch.bfloat16
+    assert residual.dtype == torch.bfloat16
+    assert post_layer_mix.dtype == torch.float32
+    assert comb_res_mix.dtype == torch.float32
+    assert x.is_cuda and residual.is_cuda
+    assert post_layer_mix.is_cuda and comb_res_mix.is_cuda
+
+    out = torch.empty((n, hc, hidden), dtype=torch.bfloat16, device=x.device)
+    if n == 0:
+        return out
+
+    # tl.arange wants pow-2; pad HC to 16 so V4-Flash hc=4 fits with margin.
+    hc_pad = 1
+    while hc_pad < max(hc, 16):
+        hc_pad *= 2
+    # tl.dot requires inner dim ≥ 16 in many backends; the cast to bf16
+    # already lifted it to ≥16 with HC=16 padding for V4-Flash hc=4.
+
+    H_BLOCK = 256
+    grid = (n, triton.cdiv(hidden, H_BLOCK))
+    # comb_res_mix has shape (n, hc_ci, hc_co): axis 1 is the inner head
+    # ("k" in the oracle's `sum_k comb[i, k, c]`), axis 2 is the output head.
+    # Pass stride(1)=ci stride, stride(2)=co stride to match kernel param order.
+    _mhc_post_kernel[grid](
+        comb_res_mix, residual, post_layer_mix, x, out,
+        n,
+        comb_res_mix.stride(0), comb_res_mix.stride(2), comb_res_mix.stride(1),
+        residual.stride(0), residual.stride(1), residual.stride(2),
+        post_layer_mix.stride(0), post_layer_mix.stride(1),
+        x.stride(0), x.stride(1),
+        out.stride(0), out.stride(1), out.stride(2),
+        HC=hc_pad,
+        HC_REAL=hc,
+        HIDDEN=hidden,
+        H_BLOCK=H_BLOCK,
+    )
+    return out

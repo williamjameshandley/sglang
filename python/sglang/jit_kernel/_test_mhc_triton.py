@@ -21,9 +21,55 @@ import torch
 import torch.nn.functional as F
 
 from sglang.jit_kernel.mhc_triton import (
+    mhc_post_triton,
     mhc_pre_gemm_sqrsum_splitk_triton,
     mhc_pre_gemm_sqrsum_triton,
 )
+
+
+def _oracle_mhc_post(x, residual, post, comb):
+    """Reference: matches `hc_post_torch_impl` in
+    `models/deepseek_v4.py:1875-1880`."""
+    return (
+        post.unsqueeze(-1) * x.unsqueeze(1)
+        + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
+    ).type_as(x)
+
+
+def _run_mhc_post_case(
+    name: str,
+    *,
+    num_tokens: int,
+    hc: int,
+    hidden: int,
+    device: torch.device,
+    seed: int,
+) -> bool:
+    g = torch.Generator(device=device).manual_seed(seed)
+    x = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device=device)
+    residual = torch.empty((num_tokens, hc, hidden), dtype=torch.bfloat16, device=device)
+    post = torch.empty((num_tokens, hc), dtype=torch.float32, device=device)
+    comb = torch.empty((num_tokens, hc, hc), dtype=torch.float32, device=device)
+    if num_tokens > 0:
+        x.uniform_(-0.5, 0.5, generator=g)
+        residual.uniform_(-0.5, 0.5, generator=g)
+        post.uniform_(-1.0, 1.0, generator=g)
+        comb.uniform_(-1.0, 1.0, generator=g)
+
+    out_t = mhc_post_triton(x, residual, post, comb)
+    out_o = _oracle_mhc_post(x, residual, post, comb)
+
+    if num_tokens == 0:
+        if out_t.shape != (0, hc, hidden):
+            print(f"[FAIL] {name}: empty shape {tuple(out_t.shape)}")
+            return False
+        print(f"[OK  ] {name}: empty fast path")
+        return True
+
+    ok, abs_, rel = _close(out_t, out_o, atol=5e-2, rtol=5e-2)
+    status = "OK  " if ok else "FAIL"
+    print(f"[{status}] {name}: abs={abs_:.3g} rel={rel:.3g}")
+    return ok
 
 
 def _oracle_pre_gemm_sqrsum(
@@ -151,10 +197,23 @@ def main() -> int:
         if not _run_pre_gemm_sqrsum_case(device=device, **case):
             failures += 1
 
+    # mhc_post cases (V4-Flash hc=4, hidden=4096)
+    post_cases = [
+        dict(name="post num_tokens=0", num_tokens=0, hc=4, hidden=4096, seed=20),
+        dict(name="post num_tokens=1", num_tokens=1, hc=4, hidden=4096, seed=21),
+        dict(name="post num_tokens=8", num_tokens=8, hc=4, hidden=4096, seed=22),
+        dict(name="post num_tokens=128", num_tokens=128, hc=4, hidden=4096, seed=23),
+        dict(name="post num_tokens=2048", num_tokens=2048, hc=4, hidden=4096, seed=24),
+    ]
+    for case in post_cases:
+        if not _run_mhc_post_case(device=device, **case):
+            failures += 1
+
+    total = len(cases) + len(post_cases)
     if failures:
-        print(f"\n{failures}/{len(cases)} cases FAILED")
+        print(f"\n{failures}/{total} cases FAILED")
         return 1
-    print(f"\nAll {len(cases)} cases passed")
+    print(f"\nAll {total} cases passed")
     return 0
 
 
