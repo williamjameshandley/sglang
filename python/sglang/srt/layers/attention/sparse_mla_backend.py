@@ -169,7 +169,11 @@ def _triton_supported(
         return False
     if is_fp8_kvcache is not True:
         return False
-    if num_splits not in (None, 1):
+    # Phase 7.3: supported set is {1, 2, 4, 8}. Larger values would cause
+    # the merge kernel to materialize an unmanageable [NUM_SPLITS, BLOCK_M,
+    # BLOCK_DV] tile; redesign to stream-over-splits is required before
+    # accepting a wider domain.
+    if num_splits is not None and num_splits not in (1, 2, 4, 8):
         return False
     if block_table is not None or cache_seqlens is not None:
         return False

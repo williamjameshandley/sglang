@@ -135,6 +135,8 @@ def _run_case(
     extra_topk: int = 0,
     extra_topk_lengths: Optional[list[int]] = None,
     extra_sprinkle_neg1: bool = False,
+    # Phase 7.3 split-KV
+    num_splits: Optional[int] = None,
 ) -> bool:
     assert len(topk_lengths) == B
     assert topk % 64 == 0
@@ -198,13 +200,16 @@ def _run_case(
         extra_indices_in_kvcache=extra_indices,
         extra_topk_length=extra_topk_length,
     )
+    triton_kwargs = dict(common_kwargs)
+    if num_splits is not None:
+        triton_kwargs["num_splits"] = num_splits
 
     out_a, lse_a = flash_mla_with_kvcache_torch_reference(**common_kwargs)
     pack_b = _call_oracle_b(common_kwargs)
     if pack_b is None:
         return False
     out_b, lse_b = pack_b
-    out_t, lse_t = flash_mla_with_kvcache_triton_sm120(**common_kwargs)
+    out_t, lse_t = flash_mla_with_kvcache_triton_sm120(**triton_kwargs)
 
     # Oracle A vs Oracle B (must agree by construction; if not, oracle bug)
     ok_ab_out, ab_out_abs, ab_out_rel = _close(out_a, out_b, atol=1e-2, rtol=1e-2)
@@ -370,6 +375,57 @@ def main() -> int:
             topk_lengths=[0], sprinkle_neg1=False, sink_zeros=False, seed=24,
             P_extra=64, extra_num_pages=8, extra_topk=64,
             extra_topk_lengths=[40], extra_sprinkle_neg1=False,
+        ),
+        # Phase 7.3 split-KV cases
+        dict(
+            name="split=2 SWA-only B=1 h=64 topk=128",
+            B=1, h_q=64, P=256, num_pages=8, topk=128,
+            topk_lengths=[100], sprinkle_neg1=False, sink_zeros=False, seed=30,
+            num_splits=2,
+        ),
+        dict(
+            name="split=4 SWA-only B=2 h=64 topk=256 -1",
+            B=2, h_q=64, P=256, num_pages=16, topk=256,
+            topk_lengths=[200, 50], sprinkle_neg1=True, sink_zeros=False, seed=31,
+            num_splits=4,
+        ),
+        dict(
+            name="split=2 C4 B=1 h=64 topk=128 + ctopk=128",
+            B=1, h_q=64, P=256, num_pages=8, topk=128,
+            topk_lengths=[100], sprinkle_neg1=False, sink_zeros=False, seed=32,
+            P_extra=64, extra_num_pages=8, extra_topk=128,
+            extra_topk_lengths=[80], extra_sprinkle_neg1=False,
+            num_splits=2,
+        ),
+        dict(
+            name="split=4 C4 boundary-spanning B=1 topk=64 ctopk=64",
+            B=1, h_q=64, P=256, num_pages=8, topk=64,
+            topk_lengths=[64], sprinkle_neg1=False, sink_zeros=False, seed=33,
+            P_extra=64, extra_num_pages=8, extra_topk=64,
+            extra_topk_lengths=[64], extra_sprinkle_neg1=False,
+            num_splits=4,
+        ),
+        dict(
+            name="split=4 C128 B=1 topk=64 ctopk=64 -1",
+            B=1, h_q=64, P=256, num_pages=8, topk=64,
+            topk_lengths=[40], sprinkle_neg1=True, sink_zeros=False, seed=34,
+            P_extra=2, extra_num_pages=64, extra_topk=64,
+            extra_topk_lengths=[30], extra_sprinkle_neg1=True,
+            num_splits=4,
+        ),
+        dict(
+            name="split=4 lonely-both-scopes",
+            B=1, h_q=64, P=256, num_pages=8, topk=64,
+            topk_lengths=[0], sprinkle_neg1=False, sink_zeros=False, seed=35,
+            P_extra=64, extra_num_pages=8, extra_topk=64,
+            extra_topk_lengths=[0], extra_sprinkle_neg1=False,
+            num_splits=4,
+        ),
+        dict(
+            name="split=8 exceeds chunks (topk=64, splits=8 > chunks=2)",
+            B=1, h_q=64, P=256, num_pages=8, topk=64,
+            topk_lengths=[40], sprinkle_neg1=False, sink_zeros=False, seed=36,
+            num_splits=8,
         ),
     ]
 
