@@ -22,9 +22,110 @@ import torch.nn.functional as F
 
 from sglang.jit_kernel.mhc_triton import (
     mhc_post_triton,
+    mhc_pre_big_fuse_triton,
     mhc_pre_gemm_sqrsum_splitk_triton,
     mhc_pre_gemm_sqrsum_triton,
 )
+
+
+def _oracle_big_fuse(gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base,
+                     residual, hidden_size, rms_eps, hc_pre_eps,
+                     hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat,
+                     hc_mult):
+    """Torch reference matching `mhc_pre_big_fuse_tilelang` semantics."""
+    n_splits, n, hc_mult3 = gemm_out_mul.shape
+    sqrsum = gemm_out_sqrsum.sum(0)
+    rms = torch.rsqrt(sqrsum / (hc_mult * hidden_size) + rms_eps)
+    mixes = gemm_out_mul.sum(0) * rms.unsqueeze(-1)
+
+    post_lin = mixes[:, hc_mult:2 * hc_mult] * hc_scale[1] + hc_base[hc_mult:2 * hc_mult]
+    post_mix = torch.sigmoid(post_lin) * hc_post_mult_value
+
+    cm_lin = mixes[:, 2 * hc_mult:] * hc_scale[2] + hc_base[2 * hc_mult:]
+    cm = cm_lin.view(n, hc_mult, hc_mult)
+
+    cm = torch.softmax(cm, dim=-1) + hc_sinkhorn_eps
+    cm = cm / (cm.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+    for _ in range(sinkhorn_repeat - 1):
+        cm = cm / (cm.sum(-1, keepdim=True) + hc_sinkhorn_eps)
+        cm = cm / (cm.sum(-2, keepdim=True) + hc_sinkhorn_eps)
+    comb_mix = cm.reshape(n, hc_mult * hc_mult)
+
+    pre_lin = mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    pre_mix = torch.sigmoid(pre_lin) + hc_pre_eps
+
+    layer_input = (pre_mix.unsqueeze(-1) * residual.float()).sum(1).bfloat16()
+    return post_mix, comb_mix, layer_input
+
+
+def _run_big_fuse_case(name, *, num_tokens, hc_mult, hidden_size, n_splits,
+                       device, seed):
+    g = torch.Generator(device=device).manual_seed(seed)
+    hc_mult3 = hc_mult * (2 + hc_mult)
+    gemm_out_mul = torch.empty(
+        (n_splits, num_tokens, hc_mult3), dtype=torch.float32, device=device,
+    )
+    gemm_out_sqrsum = torch.empty(
+        (n_splits, num_tokens), dtype=torch.float32, device=device,
+    )
+    if num_tokens > 0:
+        gemm_out_mul.uniform_(-0.5, 0.5, generator=g)
+        gemm_out_sqrsum.uniform_(0.1, 1.0, generator=g)
+    hc_scale = torch.empty(3, dtype=torch.float32, device=device)
+    hc_base = torch.empty(hc_mult3, dtype=torch.float32, device=device)
+    hc_scale.uniform_(-1.0, 1.0, generator=g)
+    hc_base.uniform_(-1.0, 1.0, generator=g)
+    residual = torch.empty(
+        (num_tokens, hc_mult, hidden_size), dtype=torch.bfloat16, device=device,
+    )
+    if num_tokens > 0:
+        residual.uniform_(-0.5, 0.5, generator=g)
+
+    post_mix = torch.empty((num_tokens, hc_mult), dtype=torch.float32, device=device)
+    comb_mix = torch.empty(
+        (num_tokens, hc_mult * hc_mult), dtype=torch.float32, device=device,
+    )
+    layer_input = torch.empty(
+        (num_tokens, hidden_size), dtype=torch.bfloat16, device=device,
+    )
+
+    rms_eps = 1e-5
+    hc_pre_eps = 1e-3
+    hc_sinkhorn_eps = 1e-3
+    hc_post_mult_value = 2.0
+    sinkhorn_repeat = 4
+
+    mhc_pre_big_fuse_triton(
+        gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, residual,
+        post_mix, comb_mix, layer_input,
+        hidden_size=hidden_size,
+        rms_eps=rms_eps, hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        n_splits=n_splits, hc_mult=hc_mult,
+    )
+
+    if num_tokens == 0:
+        print(f"[OK  ] {name}: empty fast path")
+        return True
+
+    p_o, c_o, li_o = _oracle_big_fuse(
+        gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, residual,
+        hidden_size, rms_eps, hc_pre_eps, hc_sinkhorn_eps,
+        hc_post_mult_value, sinkhorn_repeat, hc_mult,
+    )
+
+    ok_p, p_abs, p_rel = _close(post_mix, p_o, atol=5e-3, rtol=5e-3)
+    ok_c, c_abs, c_rel = _close(comb_mix, c_o, atol=5e-3, rtol=5e-3)
+    ok_l, l_abs, l_rel = _close(layer_input, li_o, atol=5e-2, rtol=5e-2)
+    ok = ok_p and ok_c and ok_l
+    status = "OK  " if ok else "FAIL"
+    print(
+        f"[{status}] {name}: post abs={p_abs:.3g} comb abs={c_abs:.3g} "
+        f"li abs={l_abs:.3g}"
+    )
+    return ok
 
 
 def _oracle_mhc_post(x, residual, post, comb):
@@ -209,7 +310,23 @@ def main() -> int:
         if not _run_mhc_post_case(device=device, **case):
             failures += 1
 
-    total = len(cases) + len(post_cases)
+    big_fuse_cases = [
+        dict(name="big_fuse n=0", num_tokens=0, hc_mult=4, hidden_size=4096,
+             n_splits=1, seed=30),
+        dict(name="big_fuse n=1", num_tokens=1, hc_mult=4, hidden_size=4096,
+             n_splits=1, seed=31),
+        dict(name="big_fuse n=8", num_tokens=8, hc_mult=4, hidden_size=4096,
+             n_splits=1, seed=32),
+        dict(name="big_fuse n=128", num_tokens=128, hc_mult=4, hidden_size=4096,
+             n_splits=1, seed=33),
+        dict(name="big_fuse n=2048", num_tokens=2048, hc_mult=4, hidden_size=4096,
+             n_splits=1, seed=34),
+    ]
+    for case in big_fuse_cases:
+        if not _run_big_fuse_case(device=device, **case):
+            failures += 1
+
+    total = len(cases) + len(post_cases) + len(big_fuse_cases)
     if failures:
         print(f"\n{failures}/{total} cases FAILED")
         return 1

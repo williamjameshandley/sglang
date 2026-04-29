@@ -16,8 +16,11 @@ Kernels in this module:
   * `_mhc_pre_gemm_sqrsum_kernel` (Phase 7.4.2): simple variant for
     `num_tokens > 2048`.
 
-  * Phase 7.4.3-7.4.6: big_fuse, mhc_post, sinkhorn — added in
-    subsequent steps.
+  * `_mhc_post_kernel` (Phase 7.4.4): per-token-per-head fused
+    `post*x + comb·residual` matching the existing torch fallback.
+
+  * Phase 7.4.3 / 7.4.6: big_fuse and sinkhorn — added in subsequent
+    steps.
 
 The reference oracle for all of these is the torch fallback in
 `python/sglang/srt/models/deepseek_v4.py` (`hc_pre_torch_impl`,
@@ -461,6 +464,246 @@ def _mhc_post_kernel(
               + co[:, None] * stride_o_c
               + h_offs[None, :] * stride_o_h)
     tl.store(o_ptrs, out_tile, mask=co_mask[:, None] & h_mask[None, :])
+
+
+@triton.jit
+def _mhc_pre_big_fuse_a_kernel(
+    GemmOutMul_ptr,      # [n_splits, n_tokens, hc_mult3] fp32
+    GemmOutSqrsum_ptr,   # [n_splits, n_tokens] fp32
+    HcScale_ptr,         # [3] fp32
+    HcBase_ptr,          # [hc_mult3] fp32
+    PostMix_ptr,         # [n_tokens, hc_mult] fp32 OUT
+    CombMix_ptr,         # [n_tokens, hc_mult * hc_mult] fp32 OUT
+    PreMix_ptr,          # [n_tokens, hc_mult] fp32 OUT (intermediate for kernel B)
+    n_tokens,
+    stride_gm_s, stride_gm_t, stride_gm_n,
+    stride_gs_s, stride_gs_t,
+    stride_pm_t, stride_pm_c,
+    stride_cm_t, stride_cm_c,
+    stride_pre_t, stride_pre_c,
+    HC_MULT: tl.constexpr,           # power-of-2 (V4-Flash hc=4)
+    HC_MULT3: tl.constexpr,          # actual ≤ 32
+    N_SPLITS: tl.constexpr,
+    HIDDEN_TIMES_HC: tl.constexpr,   # hc_mult * hidden, used in rms denominator
+    SINKHORN_REPEAT: tl.constexpr,
+    RMS_EPS: tl.constexpr,
+    HC_PRE_EPS: tl.constexpr,
+    HC_SINKHORN_EPS: tl.constexpr,
+    HC_POST_MULT_VALUE: tl.constexpr,
+):
+    """Per-token reduction + sinkhorn + post/comb/pre mix. Mirrors the
+    sub-32-thread half of `mhc_pre_big_fuse_tilelang` plus the pre_mix
+    portion of the other half.
+    """
+    pid_t = tl.program_id(0)
+
+    n_offs = tl.arange(0, 32)
+    n_mask = n_offs < HC_MULT3
+
+    j_offs = tl.arange(0, HC_MULT)              # [hc_mult]
+    jk_offs = tl.arange(0, HC_MULT * HC_MULT)   # [hc_mult²]
+
+    # 1. Sum gemm_out_sqrsum[:, t] across splits → scalar.
+    rms = 0.0
+    for s in tl.static_range(N_SPLITS):
+        rms += tl.load(GemmOutSqrsum_ptr + s * stride_gs_s + pid_t * stride_gs_t)
+    rms = 1.0 / tl.sqrt(rms / HIDDEN_TIMES_HC + RMS_EPS)
+
+    # 2. Sum gemm_out_mul[:, t, :] across splits → mixes[hc_mult3].
+    mixes = tl.zeros([32], dtype=tl.float32)
+    for s in tl.static_range(N_SPLITS):
+        gm_ptrs = (GemmOutMul_ptr
+                   + s * stride_gm_s
+                   + pid_t * stride_gm_t
+                   + n_offs * stride_gm_n)
+        mixes += tl.load(gm_ptrs, mask=n_mask, other=0.0)
+    mixes = mixes * rms
+
+    # 3. Load hc_scale [3] and hc_base [hc_mult3]
+    hc_scale_0 = tl.load(HcScale_ptr + 0)
+    hc_scale_1 = tl.load(HcScale_ptr + 1)
+    hc_scale_2 = tl.load(HcScale_ptr + 2)
+    hc_base = tl.load(HcBase_ptr + n_offs, mask=n_mask, other=0.0)
+
+    # 4. post_mix[j] = sigmoid(mixes[hc_mult + j] * scale[1] + base[hc_mult + j]) * post_mult
+    #    Element j picks index (hc_mult + j) of mixes/hc_base.
+    post_idx = HC_MULT + j_offs                        # [hc_mult]
+    post_lin = (
+        tl.sum(tl.where(n_offs[None, :] == post_idx[:, None], mixes[None, :], 0.0), axis=1)
+        * hc_scale_1
+        + tl.sum(tl.where(n_offs[None, :] == post_idx[:, None], hc_base[None, :], 0.0), axis=1)
+    )
+    post_mix = (1.0 / (1.0 + tl.exp(-post_lin))) * HC_POST_MULT_VALUE
+
+    pm_ptrs = PostMix_ptr + pid_t * stride_pm_t + j_offs * stride_pm_c
+    tl.store(pm_ptrs, post_mix)
+
+    # 5. cm[j, k] = mixes[2*hc_mult + j*hc_mult + k] * scale[2] + base[2*hc_mult + j*hc_mult + k]
+    cm_idx = 2 * HC_MULT + jk_offs                     # [hc_mult²]
+    cm_lin = (
+        tl.sum(tl.where(n_offs[None, :] == cm_idx[:, None], mixes[None, :], 0.0), axis=1)
+        * hc_scale_2
+        + tl.sum(tl.where(n_offs[None, :] == cm_idx[:, None], hc_base[None, :], 0.0), axis=1)
+    )
+    cm = tl.reshape(cm_lin, [HC_MULT, HC_MULT])
+
+    # 6. Sinkhorn:
+    # initial: comb = softmax(comb, dim=-1) + eps
+    row_max = tl.max(cm, axis=1)
+    cm = tl.exp(cm - row_max[:, None])
+    row_sum = tl.sum(cm, axis=1)
+    cm = cm / row_sum[:, None] + HC_SINKHORN_EPS
+    # initial col norm
+    col_sum = tl.sum(cm, axis=0)
+    cm = cm / (col_sum[None, :] + HC_SINKHORN_EPS)
+    # iterative row/col norm × (sinkhorn_repeat - 1)
+    for _ in tl.static_range(SINKHORN_REPEAT - 1):
+        row_sum = tl.sum(cm, axis=1)
+        cm = cm / (row_sum[:, None] + HC_SINKHORN_EPS)
+        col_sum = tl.sum(cm, axis=0)
+        cm = cm / (col_sum[None, :] + HC_SINKHORN_EPS)
+
+    cm_flat = tl.reshape(cm, [HC_MULT * HC_MULT])
+    cm_ptrs = CombMix_ptr + pid_t * stride_cm_t + jk_offs * stride_cm_c
+    tl.store(cm_ptrs, cm_flat)
+
+    # 7. pre_mix[j] = sigmoid(mixes[j] * scale[0] + base[j]) + pre_eps
+    pre_lin = (
+        tl.sum(tl.where(n_offs[None, :] == j_offs[:, None], mixes[None, :], 0.0), axis=1)
+        * hc_scale_0
+        + tl.sum(tl.where(n_offs[None, :] == j_offs[:, None], hc_base[None, :], 0.0), axis=1)
+    )
+    pre_mix = (1.0 / (1.0 + tl.exp(-pre_lin))) + HC_PRE_EPS
+    pre_ptrs = PreMix_ptr + pid_t * stride_pre_t + j_offs * stride_pre_c
+    tl.store(pre_ptrs, pre_mix)
+
+
+@triton.jit
+def _mhc_pre_big_fuse_b_kernel(
+    PreMix_ptr,          # [n_tokens, hc_mult] fp32
+    Residual_ptr,        # [n_tokens, hc_mult, hidden] bf16
+    LayerInput_ptr,      # [n_tokens, hidden] bf16 OUT
+    n_tokens,
+    stride_pre_t, stride_pre_c,
+    stride_res_t, stride_res_c, stride_res_h,
+    stride_li_t, stride_li_h,
+    HC_MULT: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    H_BLOCK: tl.constexpr,
+):
+    """layer_input[i, h] = sum_c pre_mix[i, c] * residual[i, c, h]."""
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    j_offs = tl.arange(0, HC_MULT)
+    h_offs = pid_h * H_BLOCK + tl.arange(0, H_BLOCK)
+    h_mask = h_offs < HIDDEN
+
+    pre = tl.load(PreMix_ptr + pid_t * stride_pre_t + j_offs * stride_pre_c)
+
+    res_ptrs = (Residual_ptr + pid_t * stride_res_t
+                + j_offs[:, None] * stride_res_c
+                + h_offs[None, :] * stride_res_h)
+    res = tl.load(res_ptrs, mask=h_mask[None, :], other=0.0).to(tl.float32)
+
+    out = tl.sum(pre[:, None] * res, axis=0).to(tl.bfloat16)
+    li_ptrs = LayerInput_ptr + pid_t * stride_li_t + h_offs * stride_li_h
+    tl.store(li_ptrs, out, mask=h_mask)
+
+
+def mhc_pre_big_fuse_triton(
+    gemm_out_mul: torch.Tensor,       # [n_splits, n, hc_mult3] fp32
+    gemm_out_sqrsum: torch.Tensor,    # [n_splits, n] fp32
+    hc_scale: torch.Tensor,           # [3] fp32
+    hc_base: torch.Tensor,            # [hc_mult3] fp32
+    residual: torch.Tensor,           # [n, hc_mult, hidden] bf16
+    post_mix: torch.Tensor,           # [n, hc_mult] fp32 OUT (in-place)
+    comb_mix: torch.Tensor,           # [n, hc_mult²] fp32 OUT (in-place)
+    layer_input: torch.Tensor,        # [n, hidden] bf16 OUT (in-place)
+    hidden_size: int,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    n_splits: int = 1,
+    hc_mult: int = 4,
+) -> None:
+    """Triton replacement for `mhc_pre_big_fuse_tilelang`. In-place output
+    semantics matching the existing call site at `srt/layers/mhc.py:588-605`.
+
+    Implementation: two kernels.
+      A: per-token reduction + sinkhorn → post_mix, comb_mix, pre_mix.
+      B: hidden-dim weighted sum via pre_mix → layer_input.
+
+    `pre_mix [n, hc_mult]` is materialised between A and B as fp32 scratch.
+    """
+    n_tokens = gemm_out_mul.shape[1]
+    hc_mult3 = hc_mult * (2 + hc_mult)
+
+    assert gemm_out_mul.shape == (n_splits, n_tokens, hc_mult3)
+    assert gemm_out_sqrsum.shape == (n_splits, n_tokens)
+    assert hc_scale.shape == (3,)
+    assert hc_base.shape == (hc_mult3,)
+    assert residual.shape == (n_tokens, hc_mult, hidden_size)
+    assert post_mix.shape == (n_tokens, hc_mult)
+    assert comb_mix.shape == (n_tokens, hc_mult * hc_mult)
+    assert layer_input.shape == (n_tokens, hidden_size)
+    assert gemm_out_mul.dtype == torch.float32
+    assert gemm_out_sqrsum.dtype == torch.float32
+    assert hc_scale.dtype == torch.float32
+    assert hc_base.dtype == torch.float32
+    assert residual.dtype == torch.bfloat16
+    assert post_mix.dtype == torch.float32
+    assert comb_mix.dtype == torch.float32
+    assert layer_input.dtype == torch.bfloat16
+
+    if n_tokens == 0:
+        return
+
+    # Triton requires HC_MULT to be power-of-2 for tl.arange. V4-Flash has hc=4.
+    assert (hc_mult & (hc_mult - 1)) == 0 and hc_mult >= 1, (
+        f"hc_mult={hc_mult} must be power-of-2 for the Triton kernel"
+    )
+    assert hc_mult3 <= 32
+
+    pre_mix = torch.empty(
+        (n_tokens, hc_mult), dtype=torch.float32, device=residual.device,
+    )
+
+    grid_a = (n_tokens,)
+    _mhc_pre_big_fuse_a_kernel[grid_a](
+        gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base,
+        post_mix, comb_mix, pre_mix,
+        n_tokens,
+        gemm_out_mul.stride(0), gemm_out_mul.stride(1), gemm_out_mul.stride(2),
+        gemm_out_sqrsum.stride(0), gemm_out_sqrsum.stride(1),
+        post_mix.stride(0), post_mix.stride(1),
+        comb_mix.stride(0), comb_mix.stride(1),
+        pre_mix.stride(0), pre_mix.stride(1),
+        HC_MULT=hc_mult,
+        HC_MULT3=hc_mult3,
+        N_SPLITS=n_splits,
+        HIDDEN_TIMES_HC=hc_mult * hidden_size,
+        SINKHORN_REPEAT=sinkhorn_repeat,
+        RMS_EPS=rms_eps,
+        HC_PRE_EPS=hc_pre_eps,
+        HC_SINKHORN_EPS=hc_sinkhorn_eps,
+        HC_POST_MULT_VALUE=hc_post_mult_value,
+    )
+
+    H_BLOCK = 256
+    grid_b = (n_tokens, triton.cdiv(hidden_size, H_BLOCK))
+    _mhc_pre_big_fuse_b_kernel[grid_b](
+        pre_mix, residual, layer_input,
+        n_tokens,
+        pre_mix.stride(0), pre_mix.stride(1),
+        residual.stride(0), residual.stride(1), residual.stride(2),
+        layer_input.stride(0), layer_input.stride(1),
+        HC_MULT=hc_mult,
+        HIDDEN=hidden_size,
+        H_BLOCK=H_BLOCK,
+    )
 
 
 def mhc_post_triton(
