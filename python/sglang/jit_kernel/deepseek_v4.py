@@ -189,23 +189,6 @@ def _topk_transform_512_v2_page_only_(
     )
 
 
-@register_custom_op(
-    op_name="deepseek_v4_topk_transform_512_v2_raw_",
-    mutates_args=["out_page_indices", "out_raw_indices"],
-)
-def _topk_transform_512_v2_raw_(
-    scores: torch.Tensor,
-    seq_lens: torch.Tensor,
-    page_tables: torch.Tensor,
-    out_page_indices: torch.Tensor,
-    out_raw_indices: torch.Tensor,
-    page_size: int,
-) -> None:
-    _jit_topk_v2_module().topk_transform(
-        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices,
-    )
-
-
 def topk_transform_512(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -215,16 +198,19 @@ def topk_transform_512(
     out_raw_indices: Optional[torch.Tensor] = None,
     ver: Literal[1, 2] = 1,
 ) -> None:
-    """Output to page_indices tensor, optionally also output raw abs position indices"""
+    """Output to page_indices tensor, optionally also output raw abs position indices.
+
+    `ver=2` does not support `out_raw_indices` — the C++ wrapper at
+    csrc/deepseek_v4/topk_v2.cuh:347-374 rejects a non-None sixth arg.
+    """
     if ver == 2:
-        if out_raw_indices is None:
-            _topk_transform_512_v2_page_only_(
-                scores, seq_lens, page_tables, out_page_indices, page_size,
+        if out_raw_indices is not None:
+            raise NotImplementedError(
+                "topk_transform_512 ver=2 does not support out_raw_indices"
             )
-        else:
-            _topk_transform_512_v2_raw_(
-                scores, seq_lens, page_tables, out_page_indices, out_raw_indices, page_size,
-            )
+        _topk_transform_512_v2_page_only_(
+            scores, seq_lens, page_tables, out_page_indices, page_size,
+        )
     else:
         if out_raw_indices is None:
             _topk_transform_512_v1_page_only_(
@@ -360,7 +346,7 @@ def compress_plan(
 
 @register_custom_op(
     op_name="deepseek_v4_compress_forward_decode_fill_",
-    mutates_args=["out"],
+    mutates_args=["kv_score_buffer", "out"],
 )
 def _compress_forward_decode_fill_(
     kv_score_buffer: torch.Tensor,
@@ -382,7 +368,7 @@ def _compress_forward_decode_fill_(
 
 @register_custom_op(
     op_name="deepseek_v4_compress_forward_prefill_fill_",
-    mutates_args=["out"],
+    mutates_args=["kv_score_buffer", "out"],
 )
 def _compress_forward_prefill_fill_(
     kv_score_buffer: torch.Tensor,
@@ -432,6 +418,17 @@ def compress_forward(
     if out is None:
         out = kv_score_input.new_empty((num_q_tokens, head_dim))
     if plan is None:
+        # compress_plan() invokes _jit_common_module().plan_compress_prefill(...)
+        # whose returned plan_lens drive data-dependent slicing — incompatible
+        # with PCG/Dynamo capture. Fail loud here rather than surface as an
+        # opaque graph-break in the C++ binding.
+        if torch._dynamo.is_compiling():
+            raise RuntimeError(
+                "compress_forward(plan=None) is not PCG-safe; precompute the "
+                "plan in eager Python (via compress_plan / make_compressor_plan) "
+                "before calling compress_forward inside a Dynamo-compiled "
+                "forward."
+            )
         assert seq_lens is not None
         plan = compress_plan(
             compress_ratio,
