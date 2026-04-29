@@ -308,16 +308,22 @@ def to_triton_kernels_format(
             n_expts_tot, n_expts_act, topk_ids.device
         )
 
-    assert (
-        topk_ids.min().item() >= 0
-    ), "to_triton_kernels_format requires topk_ids >= 0 (no -1 padded sentinels)"
-    assert (
-        topk_ids.max().item() < n_expts_tot
-    ), f"to_triton_kernels_format requires topk_ids < {n_expts_tot}"
-    sorted_ids, _ = topk_ids.sort(dim=1)
-    assert not (
-        sorted_ids[:, 1:] == sorted_ids[:, :-1]
-    ).any(), "to_triton_kernels_format requires unique expert IDs per token"
+    # The min/max/`.any()` calls below all do host-side sync via `.item()`,
+    # which `cudaErrorStreamCaptureUnsupported` rejects inside CUDA graph
+    # capture. Skip the sanity checks while capturing — by that point the
+    # graph is already capturing identical kernel launches that have been
+    # validated outside capture.
+    if not torch.cuda.is_current_stream_capturing():
+        assert (
+            topk_ids.min().item() >= 0
+        ), "to_triton_kernels_format requires topk_ids >= 0 (no -1 padded sentinels)"
+        assert (
+            topk_ids.max().item() < n_expts_tot
+        ), f"to_triton_kernels_format requires topk_ids < {n_expts_tot}"
+        sorted_ids, _ = topk_ids.sort(dim=1)
+        assert not (
+            sorted_ids[:, 1:] == sorted_ids[:, :-1]
+        ).any(), "to_triton_kernels_format requires unique expert IDs per token"
 
     # Power-of-2 padding still required in v3.6.0: the upstream `tl.topk`
     # replacement only covered `streaming_topk`'s search loop, but
