@@ -277,3 +277,113 @@ def mhc_pre_gemm_sqrsum_splitk_triton(
     )
 
     return out, sqrsum
+
+
+@triton.jit
+def _mhc_pre_gemm_sqrsum_kernel(
+    X_ptr,             # [num_tokens, hc_hidden] bf16
+    Fn_ptr,            # [hc_mult3, hc_hidden] fp32
+    Out_ptr,           # [num_tokens, hc_mult3] fp32
+    Sqrsum_ptr,        # [num_tokens] fp32
+    num_tokens,
+    stride_x_t, stride_x_h,
+    stride_fn_n, stride_fn_h,
+    stride_o_t, stride_o_n,
+    stride_s_t,
+    HC_MULT3: tl.constexpr,
+    HIDDEN: tl.constexpr,
+    HIDDEN_BLOCK: tl.constexpr,
+    TOKEN_BLOCK: tl.constexpr,
+):
+    """Single-stage GEMM + sqrsum (no split-K).
+
+    One program per token block. Loops over the full hidden dim in
+    HIDDEN_BLOCK chunks. Mirrors `mhc_pre_gemm_sqrsum_tilelang` at
+    `srt/layers/mhc.py:268-339` for `num_tokens > 2048`.
+    """
+    pid_tok = tl.program_id(0)
+
+    tok_offs = pid_tok * TOKEN_BLOCK + tl.arange(0, TOKEN_BLOCK)
+    tok_mask = tok_offs < num_tokens
+
+    n_offs = tl.arange(0, 32)
+    n_mask = n_offs < HC_MULT3
+
+    out_acc = tl.zeros([TOKEN_BLOCK, 32], dtype=tl.float32)
+    sqr_acc = tl.zeros([TOKEN_BLOCK], dtype=tl.float32)
+
+    h_block_offs = tl.arange(0, HIDDEN_BLOCK)
+    num_h_chunks = HIDDEN // HIDDEN_BLOCK
+
+    for pz in range(0, num_h_chunks):
+        h_offs = pz * HIDDEN_BLOCK + h_block_offs
+
+        x_ptrs = (X_ptr
+                  + tok_offs[:, None] * stride_x_t
+                  + h_offs[None, :] * stride_x_h)
+        x_bf = tl.load(x_ptrs, mask=tok_mask[:, None], other=0.0)
+        x_f32 = x_bf.to(tl.float32)
+
+        sqr_acc += tl.sum(x_f32 * x_f32, axis=1)
+
+        fn_ptrs = (Fn_ptr
+                   + n_offs[:, None] * stride_fn_n
+                   + h_offs[None, :] * stride_fn_h)
+        fn_f = tl.load(fn_ptrs, mask=n_mask[:, None], other=0.0)
+        fn_bf = fn_f.to(tl.bfloat16)
+        out_acc += tl.dot(x_bf, tl.trans(fn_bf), out_dtype=tl.float32)
+
+    o_ptrs = (Out_ptr
+              + tok_offs[:, None] * stride_o_t
+              + n_offs[None, :] * stride_o_n)
+    tl.store(o_ptrs, out_acc, mask=tok_mask[:, None] & n_mask[None, :])
+
+    s_ptrs = Sqrsum_ptr + tok_offs * stride_s_t
+    tl.store(s_ptrs, sqr_acc, mask=tok_mask)
+
+
+def mhc_pre_gemm_sqrsum_triton(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    hc_mult3: int,
+    token_block: int = 32,
+    hidden_block: int = 256,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Triton replacement for `mhc_pre_gemm_sqrsum_tilelang` (the
+    `num_tokens > 2048` path)."""
+    num_tokens, hc_hidden = x.shape
+    assert fn.ndim == 2 and fn.shape == (hc_mult3, hc_hidden), (
+        f"fn shape {tuple(fn.shape)} must be ({hc_mult3}, {hc_hidden})"
+    )
+    assert hc_mult3 <= 32
+    assert hc_hidden % hidden_block == 0, (
+        f"hc_hidden={hc_hidden} must be divisible by hidden_block={hidden_block}"
+    )
+    assert x.dtype == torch.bfloat16
+    assert fn.dtype == torch.float32
+    assert x.is_cuda and fn.is_cuda
+    assert x.device == fn.device
+
+    if num_tokens == 0:
+        out = torch.empty((0, hc_mult3), dtype=torch.float32, device=x.device)
+        sqrsum = torch.empty((0,), dtype=torch.float32, device=x.device)
+        return out, sqrsum
+
+    out = torch.empty((num_tokens, hc_mult3), dtype=torch.float32, device=x.device)
+    sqrsum = torch.empty((num_tokens,), dtype=torch.float32, device=x.device)
+
+    grid = (triton.cdiv(num_tokens, token_block),)
+    _mhc_pre_gemm_sqrsum_kernel[grid](
+        x, fn, out, sqrsum,
+        num_tokens,
+        x.stride(0), x.stride(1),
+        fn.stride(0), fn.stride(1),
+        out.stride(0), out.stride(1),
+        sqrsum.stride(0),
+        HC_MULT3=hc_mult3,
+        HIDDEN=hc_hidden,
+        HIDDEN_BLOCK=hidden_block,
+        TOKEN_BLOCK=token_block,
+    )
+
+    return out, sqrsum

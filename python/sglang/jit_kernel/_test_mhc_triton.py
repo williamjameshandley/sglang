@@ -20,7 +20,10 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.jit_kernel.mhc_triton import mhc_pre_gemm_sqrsum_splitk_triton
+from sglang.jit_kernel.mhc_triton import (
+    mhc_pre_gemm_sqrsum_splitk_triton,
+    mhc_pre_gemm_sqrsum_triton,
+)
 
 
 def _oracle_pre_gemm_sqrsum(
@@ -56,6 +59,7 @@ def _run_pre_gemm_sqrsum_case(
     n_splits_pre: int,
     device: torch.device,
     seed: int,
+    use_simple: bool = False,
 ) -> bool:
     g = torch.Generator(device=device).manual_seed(seed)
     x = torch.empty((num_tokens, hc_hidden), dtype=torch.bfloat16, device=device)
@@ -64,9 +68,12 @@ def _run_pre_gemm_sqrsum_case(
     fn = torch.empty((hc_mult3, hc_hidden), dtype=torch.float32, device=device)
     fn.uniform_(-0.05, 0.05, generator=g)
 
-    out_t, sqr_t = mhc_pre_gemm_sqrsum_splitk_triton(
-        x, fn, hc_mult3=hc_mult3, n_splits_pre=n_splits_pre,
-    )
+    if use_simple:
+        out_t, sqr_t = mhc_pre_gemm_sqrsum_triton(x, fn, hc_mult3=hc_mult3)
+    else:
+        out_t, sqr_t = mhc_pre_gemm_sqrsum_splitk_triton(
+            x, fn, hc_mult3=hc_mult3, n_splits_pre=n_splits_pre,
+        )
     out_o, sqr_o = _oracle_pre_gemm_sqrsum(x, fn)
 
     if num_tokens == 0:
@@ -126,6 +133,17 @@ def main() -> int:
         dict(name="num_tokens=128 split_k=8",
              num_tokens=128, hc_mult3=HC_MULT3, hc_hidden=HC_HIDDEN,
              n_splits_pre=8, seed=7),
+        # Simple (non-split-K) path: num_tokens > 2048 hits this on the
+        # live deployment per `mhc.py:575-586`.
+        dict(name="simple num_tokens=0",
+             num_tokens=0, hc_mult3=HC_MULT3, hc_hidden=HC_HIDDEN,
+             n_splits_pre=1, seed=10, use_simple=True),
+        dict(name="simple num_tokens=2049",
+             num_tokens=2049, hc_mult3=HC_MULT3, hc_hidden=HC_HIDDEN,
+             n_splits_pre=1, seed=11, use_simple=True),
+        dict(name="simple num_tokens=4096",
+             num_tokens=4096, hc_mult3=HC_MULT3, hc_hidden=HC_HIDDEN,
+             n_splits_pre=1, seed=12, use_simple=True),
     ]
 
     failures = 0
