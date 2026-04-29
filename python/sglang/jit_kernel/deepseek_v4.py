@@ -1458,6 +1458,26 @@ def flash_mla_with_kvcache_triton_sm120(
     `sparse_mla_backend.get_sparse_mla_decode_backend`'s `_triton_supported`
     predicate; the dispatcher routes incompatible calls elsewhere, but the
     asserts here are defence-in-depth.
+
+    SPECULATIVE DECODING NOTE (Phase 7 analysis): the `s_q == 1` assert
+    is structurally satisfied for `speculative_num_draft_tokens > 1` and
+    target-verify code paths. The main sparse-MLA Q path flattens all
+    leading dimensions in `MQALayer._compute_q_b` and `_forward_prepare`
+    via `q = q.view(-1, n_local_heads, head_dim)`
+    (`models/deepseek_v4.py:1414-1416` and `:1527-1528`), so q is always
+    3-D `[bs_effective, n_heads, head_dim]` for the flattened
+    multi-token draft path (`speculative_num_draft_tokens > 1`). The
+    conditional
+    unsqueeze at `deepseek_v4_backend_radix.py:1065-1067` then yields
+    `[bs_effective, 1, n_heads, head_dim]` — always s_q==1 with
+    effective batch `B*qo_len`.
+
+    This proves the contract for flattened multi-token speculative
+    decoding via `speculative_num_draft_tokens > 1`. It does NOT cover
+    `speculative_eagle_topk > 1`, which has a separate cap at
+    `deepseek_v4_backend_radix.py:412` and would need its own analysis
+    of how multi-branch EAGLE constructs query tensors. Phase 7 does
+    not lift that cap.
     """
     # Contract: live call site never passes these.
     assert block_table is None
@@ -1477,7 +1497,10 @@ def flash_mla_with_kvcache_triton_sm120(
 
     assert q.ndim == 4, f"q must be [B, s_q, h_q, d_qk]; got {tuple(q.shape)}"
     B, s_q, h_q, d_qk = q.shape
-    assert s_q == 1, "Triton sparse-MLA path only supports s_q==1 (Phase 6.8 covers s_q>1)"
+    assert s_q == 1, (
+        "Triton sparse-MLA path expects Contract A flattened decode "
+        "([B_effective, 1, H, D]); true s_q>1 is not implemented"
+    )
     assert d_qk == 512
     assert head_dim_v == 512
     assert h_q % 16 == 0, f"h_q must be divisible by BLOCK_M=16; got {h_q}"
