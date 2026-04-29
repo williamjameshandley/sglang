@@ -312,8 +312,9 @@ def to_triton_kernels_format(
     # which `cudaErrorStreamCaptureUnsupported` rejects inside CUDA graph
     # capture. Skip the sanity checks while capturing — by that point the
     # graph is already capturing identical kernel launches that have been
-    # validated outside capture.
-    if not torch.cuda.is_current_stream_capturing():
+    # validated outside capture. The `is_cuda` short-circuit avoids a
+    # capture-state query when the tensors are CPU.
+    if not (topk_ids.is_cuda and torch.cuda.is_current_stream_capturing()):
         assert (
             topk_ids.min().item() >= 0
         ), "to_triton_kernels_format requires topk_ids >= 0 (no -1 padded sentinels)"
