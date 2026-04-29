@@ -973,6 +973,36 @@ def fp8_paged_mqa_logits_triton(
     PAGE_F32 = PAGE_BYTES // 4                      # 2112
     SCALE_F32_BASE = K_BYTES_PER_PAGE // 4          # 2048
 
+    # Phase 6.11 capture-trace + warmed-spec guard. Spec captures all Triton
+    # constexpr meta values + pointer dtypes that affect specialization.
+    fp8_spec = (
+        int(num_heads),
+        int(block_size),
+        int(head_dim),
+        int(page_table.shape[1]),
+        int(max_seq_len),
+        str(q_fp8.dtype),
+        str(kvcache_fp8.dtype),
+        str(weight.dtype),
+        str(seq_lens.dtype),
+        str(page_table.dtype),
+    )
+    fp8_capturing = _capture_trace_once(
+        "fp8_paged_mqa_logits", fp8_spec,
+        warmed=_FP8_MQA_WARMED_SPECS, phase="enter",
+    )
+    if fp8_capturing and fp8_spec not in _FP8_MQA_WARMED_SPECS:
+        import sys as _sys
+        _sys.stderr.write(
+            f"[capture-trace] FATAL unwarmed fp8_paged_mqa_logits spec={fp8_spec} "
+            f"warmed={sorted(_FP8_MQA_WARMED_SPECS)}\n"
+        )
+        _sys.stderr.flush()
+        raise RuntimeError(
+            f"fp8_paged_mqa_logits_triton: spec {fp8_spec} hit CUDA graph "
+            f"capture without prior warmup."
+        )
+
     cache_contig = kvcache_fp8.contiguous()
     # Reinterpret cache bytes as FP8 (for K loads) and fp32 (for scale).
     # The torch reference at compressed/indexer.py:78 does the same view; the
@@ -1013,6 +1043,13 @@ def fp8_paged_mqa_logits_triton(
         SCALE_F32_BASE=SCALE_F32_BASE,
         BLOCK_S=BLOCK_S,
     )
+
+    if not fp8_capturing:
+        _FP8_MQA_WARMED_SPECS.add(fp8_spec)
+    _capture_trace_once(
+        "fp8_paged_mqa_logits", fp8_spec,
+        warmed=_FP8_MQA_WARMED_SPECS, phase="exit",
+    )
     return scores
 
 
@@ -1028,7 +1065,37 @@ def fp8_paged_mqa_logits_triton(
 # case instead of letting CUDA report cudaErrorStreamCaptureInvalidated at
 # capture_end.
 _SPARSE_MLA_WARMED_SPECS: set = set()
-_SPARSE_MLA_DEBUG_LOGGED: dict = {}
+_FP8_MQA_WARMED_SPECS: set = set()
+# Per-(name, spec, capturing, phase) one-shot trace log
+_CAPTURE_TRACE_LOGGED: set = set()
+
+
+def _capture_trace_once(name: str, spec, warmed=None, phase: str = "enter"):
+    """Phase-6.11 stderr trace at Triton wrapper entry/exit.
+
+    Logs (once per unique (name, spec, capturing, phase)) whether the
+    wrapper is reached during graph capture and whether the spec was
+    pre-warmed. Used to disambiguate "wrapper not called during capture"
+    from "wrapper called and silently OK" without a separate rebuild.
+
+    Caller must call once at entry (`phase="enter"`) and once after the
+    kernel launch (`phase="exit"`); a missing exit while the enter ran
+    under capture means the wrapper raised between the two.
+    """
+    import sys
+    capturing = torch.cuda.is_current_stream_capturing()
+    key = (name, spec, capturing, phase)
+    if key not in _CAPTURE_TRACE_LOGGED:
+        warmed_str = ""
+        if warmed is not None:
+            warmed_str = f" warmed={spec in warmed}"
+        sys.stderr.write(
+            f"[capture-trace] {phase} {name} spec={spec} "
+            f"capturing={capturing}{warmed_str}\n"
+        )
+        sys.stderr.flush()
+        _CAPTURE_TRACE_LOGGED.add(key)
+    return capturing
 
 
 @triton.jit
@@ -1539,41 +1606,37 @@ def flash_mla_with_kvcache_triton_sm120(
     # add a per-layer aten::_to_copy op that was a needless alloc/copy.
     sink = attn_sink
 
-    # Spec-tracking guard. CUDA graph capture cannot handle a Triton
-    # specialization that hits its first JIT-compile inside capture (it
-    # invalidates the stream). If the spec wasn't pre-warmed, fail with a
-    # clear Python error instead of the opaque cudaErrorStreamCaptureInvalidated
-    # at capture_end. The set is module-global; repeated launches don't
-    # rebuild it.
+    # Spec-tracking guard + capture trace. Triton specializations include
+    # constexpr meta values AND pointer dtypes — all included so that a JIT
+    # mismatch between warmup and capture is caught explicitly.
     spec = (
         bool(has_extra),
         int(topk),
         int(extra_topk),
-        # h_q controls grid Y but not constexpr, so excluded.
+        str(q.dtype),
+        str(k_cache.dtype),
+        str(indices.dtype),
+        str(topk_length.dtype),
+        str(attn_sink.dtype),
+        str(extra_k_cache.dtype) if has_extra else None,
+        str(extra_indices_in_kvcache.dtype) if has_extra else None,
+        str(extra_topk_length.dtype) if has_extra else None,
     )
-    capturing = torch.cuda.is_current_stream_capturing()
-    if not _SPARSE_MLA_DEBUG_LOGGED.get(spec):
-        # One-time-per-spec log: confirms whether this wrapper is reached
-        # during warmup and during capture, and whether the spec was warmed.
+    capturing = _capture_trace_once(
+        "sparse_mla", spec, warmed=_SPARSE_MLA_WARMED_SPECS, phase="enter",
+    )
+    if capturing and spec not in _SPARSE_MLA_WARMED_SPECS:
         import sys
         sys.stderr.write(
-            f"[sparse_mla_triton_sm120] spec={spec} capturing={capturing} "
-            f"warmed_already={spec in _SPARSE_MLA_WARMED_SPECS} "
-            f"all_warmed={sorted(_SPARSE_MLA_WARMED_SPECS)}\n"
+            f"[capture-trace] FATAL unwarmed sparse_mla spec={spec} "
+            f"warmed={sorted(_SPARSE_MLA_WARMED_SPECS)}\n"
         )
         sys.stderr.flush()
-        _SPARSE_MLA_DEBUG_LOGGED[spec] = True
-    if capturing:
-        if spec not in _SPARSE_MLA_WARMED_SPECS:
-            raise RuntimeError(
-                f"sparse_mla_triton_sm120: spec {spec} hit CUDA graph capture "
-                f"without prior warmup. Known warmed specs: "
-                f"{sorted(_SPARSE_MLA_WARMED_SPECS)}. "
-                f"Pre-launch this spec outside capture to JIT-compile the "
-                f"Triton kernel before it is recorded."
-            )
-    else:
-        _SPARSE_MLA_WARMED_SPECS.add(spec)
+        raise RuntimeError(
+            f"sparse_mla_triton_sm120: spec {spec} hit CUDA graph capture "
+            f"without prior warmup. Known warmed specs: "
+            f"{sorted(_SPARSE_MLA_WARMED_SPECS)}."
+        )
 
     grid = (B, h_q // BLOCK_M, HEAD_DIM_QK // BLOCK_DV)
     _sparse_mla_decode_kernel[grid](
@@ -1613,6 +1676,12 @@ def flash_mla_with_kvcache_triton_sm120(
         HAS_EXTRA=has_extra,
         NOPE_GROUPS=7,
         GROUP_SIZE=64,
+    )
+
+    if not capturing:
+        _SPARSE_MLA_WARMED_SPECS.add(spec)
+    _capture_trace_once(
+        "sparse_mla", spec, warmed=_SPARSE_MLA_WARMED_SPECS, phase="exit",
     )
 
     return output, lse
