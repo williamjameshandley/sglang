@@ -467,6 +467,147 @@ def _mhc_post_kernel(
 
 
 @triton.jit
+def _hc_split_sinkhorn_kernel(
+    Mixes_ptr,        # [n, mix_hc] fp32
+    HcScale_ptr,      # [3] fp32
+    HcBase_ptr,       # [mix_hc] fp32
+    Pre_ptr,          # [n, hc] fp32 OUT
+    Post_ptr,         # [n, hc] fp32 OUT
+    Comb_ptr,         # [n, hc, hc] fp32 OUT
+    n_tokens,
+    stride_m_t, stride_m_n,
+    stride_pre_t, stride_pre_c,
+    stride_post_t, stride_post_c,
+    stride_comb_t, stride_comb_j, stride_comb_k,
+    HC: tl.constexpr,
+    MIX_HC: tl.constexpr,        # actual ≤ 32
+    SINKHORN_ITERS: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    """Mirrors `hc_split_sinkhorn_kernel` at `srt/layers/mhc.py:25-93`.
+    Same sinkhorn semantics as `_mhc_pre_big_fuse_a_kernel`; differs in
+    that `mixes` is already computed (no per-split reduction or rsqrt)
+    and `post = 2*sigmoid(...)` (no +eps, no separate post_mult).
+    """
+    pid_t = tl.program_id(0)
+
+    n_offs = tl.arange(0, 32)
+    n_mask = n_offs < MIX_HC
+
+    j_offs = tl.arange(0, HC)
+    jk_offs = tl.arange(0, HC * HC)
+
+    # Load mixes[t, :], hc_scale, hc_base
+    mixes = tl.load(
+        Mixes_ptr + pid_t * stride_m_t + n_offs * stride_m_n,
+        mask=n_mask, other=0.0,
+    )
+    hc_scale_0 = tl.load(HcScale_ptr + 0)
+    hc_scale_1 = tl.load(HcScale_ptr + 1)
+    hc_scale_2 = tl.load(HcScale_ptr + 2)
+    hc_base = tl.load(HcBase_ptr + n_offs, mask=n_mask, other=0.0)
+
+    # pre[j] = sigmoid(mixes[j] * scale[0] + base[j]) + eps
+    pre_lin = (
+        tl.sum(tl.where(n_offs[None, :] == j_offs[:, None], mixes[None, :], 0.0), axis=1)
+        * hc_scale_0
+        + tl.sum(tl.where(n_offs[None, :] == j_offs[:, None], hc_base[None, :], 0.0), axis=1)
+    )
+    pre = (1.0 / (1.0 + tl.exp(-pre_lin))) + EPS
+    tl.store(Pre_ptr + pid_t * stride_pre_t + j_offs * stride_pre_c, pre)
+
+    # post[j] = 2 * sigmoid(mixes[hc + j] * scale[1] + base[hc + j])
+    post_idx = HC + j_offs
+    post_lin = (
+        tl.sum(tl.where(n_offs[None, :] == post_idx[:, None], mixes[None, :], 0.0), axis=1)
+        * hc_scale_1
+        + tl.sum(tl.where(n_offs[None, :] == post_idx[:, None], hc_base[None, :], 0.0), axis=1)
+    )
+    post = 2.0 * (1.0 / (1.0 + tl.exp(-post_lin)))
+    tl.store(Post_ptr + pid_t * stride_post_t + j_offs * stride_post_c, post)
+
+    # comb[j,k] = mixes[2*hc + j*hc + k] * scale[2] + base[2*hc + j*hc + k]
+    cm_idx = 2 * HC + jk_offs
+    cm_lin = (
+        tl.sum(tl.where(n_offs[None, :] == cm_idx[:, None], mixes[None, :], 0.0), axis=1)
+        * hc_scale_2
+        + tl.sum(tl.where(n_offs[None, :] == cm_idx[:, None], hc_base[None, :], 0.0), axis=1)
+    )
+    cm = tl.reshape(cm_lin, [HC, HC])
+
+    # Sinkhorn (initial softmax row + col norm)
+    row_max = tl.max(cm, axis=1)
+    cm = tl.exp(cm - row_max[:, None])
+    row_sum = tl.sum(cm, axis=1)
+    cm = cm / row_sum[:, None] + EPS
+    col_sum = tl.sum(cm, axis=0)
+    cm = cm / (col_sum[None, :] + EPS)
+
+    for _ in tl.static_range(SINKHORN_ITERS - 1):
+        row_sum = tl.sum(cm, axis=1)
+        cm = cm / (row_sum[:, None] + EPS)
+        col_sum = tl.sum(cm, axis=0)
+        cm = cm / (col_sum[None, :] + EPS)
+
+    # Store comb [hc, hc]
+    comb_ptrs = (Comb_ptr + pid_t * stride_comb_t
+                 + j_offs[:, None] * stride_comb_j
+                 + j_offs[None, :] * stride_comb_k)
+    tl.store(comb_ptrs, cm)
+
+
+def hc_split_sinkhorn_triton(
+    mixes: torch.Tensor,         # [b, s, mix_hc] fp32
+    hc_scale: torch.Tensor,      # [3] fp32
+    hc_base: torch.Tensor,       # [mix_hc] fp32
+    hc_mult: int = 4,
+    sinkhorn_iters: int = 20,
+    eps: float = 1e-6,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Triton replacement for `hc_split_sinkhorn`. Same I/O shape as the
+    TileLang version: returns `(pre, post, comb)` shape
+    `(b, s, hc), (b, s, hc), (b, s, hc, hc)` all fp32.
+    """
+    b, s, mix_hc_actual = mixes.shape
+    assert mix_hc_actual == (2 + hc_mult) * hc_mult
+    assert hc_scale.shape == (3,)
+    assert hc_base.shape == (mix_hc_actual,)
+    assert mixes.dtype == hc_scale.dtype == hc_base.dtype == torch.float32
+    assert mixes.is_cuda
+
+    pre = mixes.new_empty(b, s, hc_mult)
+    post = mixes.new_empty(b, s, hc_mult)
+    comb = mixes.new_empty(b, s, hc_mult, hc_mult)
+
+    n = b * s
+    if n == 0:
+        return pre, post, comb
+
+    assert (hc_mult & (hc_mult - 1)) == 0 and hc_mult >= 1
+    assert mix_hc_actual <= 32
+
+    mixes_flat = mixes.reshape(n, mix_hc_actual)
+    pre_flat = pre.view(n, hc_mult)
+    post_flat = post.view(n, hc_mult)
+    comb_flat = comb.view(n, hc_mult, hc_mult)
+
+    grid = (n,)
+    _hc_split_sinkhorn_kernel[grid](
+        mixes_flat, hc_scale, hc_base, pre_flat, post_flat, comb_flat,
+        n,
+        mixes_flat.stride(0), mixes_flat.stride(1),
+        pre_flat.stride(0), pre_flat.stride(1),
+        post_flat.stride(0), post_flat.stride(1),
+        comb_flat.stride(0), comb_flat.stride(1), comb_flat.stride(2),
+        HC=hc_mult,
+        MIX_HC=mix_hc_actual,
+        SINKHORN_ITERS=sinkhorn_iters,
+        EPS=eps,
+    )
+    return pre, post, comb
+
+
+@triton.jit
 def _mhc_pre_big_fuse_a_kernel(
     GemmOutMul_ptr,      # [n_splits, n_tokens, hc_mult3] fp32
     GemmOutSqrsum_ptr,   # [n_splits, n_tokens] fp32

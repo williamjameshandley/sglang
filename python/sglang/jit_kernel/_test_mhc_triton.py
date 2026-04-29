@@ -21,11 +21,63 @@ import torch
 import torch.nn.functional as F
 
 from sglang.jit_kernel.mhc_triton import (
+    hc_split_sinkhorn_triton,
     mhc_post_triton,
     mhc_pre_big_fuse_triton,
     mhc_pre_gemm_sqrsum_splitk_triton,
     mhc_pre_gemm_sqrsum_triton,
 )
+
+
+def _oracle_hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult,
+                              sinkhorn_iters, eps):
+    """Torch reference for `hc_split_sinkhorn`."""
+    b, s, _ = mixes.shape
+    pre_lin = mixes[..., :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+    pre = torch.sigmoid(pre_lin) + eps
+
+    post_lin = mixes[..., hc_mult:2 * hc_mult] * hc_scale[1] + hc_base[hc_mult:2 * hc_mult]
+    post = 2.0 * torch.sigmoid(post_lin)
+
+    cm_lin = mixes[..., 2 * hc_mult:] * hc_scale[2] + hc_base[2 * hc_mult:]
+    cm = cm_lin.view(b, s, hc_mult, hc_mult)
+
+    cm = torch.softmax(cm, dim=-1) + eps
+    cm = cm / (cm.sum(-2, keepdim=True) + eps)
+    for _ in range(sinkhorn_iters - 1):
+        cm = cm / (cm.sum(-1, keepdim=True) + eps)
+        cm = cm / (cm.sum(-2, keepdim=True) + eps)
+    return pre, post, cm
+
+
+def _run_sinkhorn_case(name, *, b, s, hc_mult, device, seed):
+    g = torch.Generator(device=device).manual_seed(seed)
+    mix_hc = (2 + hc_mult) * hc_mult
+    mixes = torch.empty((b, s, mix_hc), dtype=torch.float32, device=device)
+    hc_scale = torch.empty(3, dtype=torch.float32, device=device)
+    hc_base = torch.empty(mix_hc, dtype=torch.float32, device=device)
+    if b * s > 0:
+        mixes.uniform_(-0.5, 0.5, generator=g)
+    hc_scale.uniform_(-1.0, 1.0, generator=g)
+    hc_base.uniform_(-1.0, 1.0, generator=g)
+
+    pre_t, post_t, comb_t = hc_split_sinkhorn_triton(
+        mixes, hc_scale, hc_base, hc_mult=hc_mult,
+        sinkhorn_iters=20, eps=1e-6,
+    )
+    if b * s == 0:
+        print(f"[OK  ] {name}: empty fast path")
+        return True
+    pre_o, post_o, comb_o = _oracle_hc_split_sinkhorn(
+        mixes, hc_scale, hc_base, hc_mult, 20, 1e-6,
+    )
+    ok_pre, p_abs, _ = _close(pre_t, pre_o, atol=1e-5, rtol=1e-5)
+    ok_post, po_abs, _ = _close(post_t, post_o, atol=1e-5, rtol=1e-5)
+    ok_comb, c_abs, _ = _close(comb_t, comb_o, atol=1e-5, rtol=1e-5)
+    ok = ok_pre and ok_post and ok_comb
+    status = "OK  " if ok else "FAIL"
+    print(f"[{status}] {name}: pre={p_abs:.3g} post={po_abs:.3g} comb={c_abs:.3g}")
+    return ok
 
 
 def _oracle_big_fuse(gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base,
@@ -326,7 +378,18 @@ def main() -> int:
         if not _run_big_fuse_case(device=device, **case):
             failures += 1
 
-    total = len(cases) + len(post_cases) + len(big_fuse_cases)
+    sinkhorn_cases = [
+        dict(name="sinkhorn b=0", b=0, s=0, hc_mult=4, seed=40),
+        dict(name="sinkhorn b=1 s=1", b=1, s=1, hc_mult=4, seed=41),
+        dict(name="sinkhorn b=2 s=8", b=2, s=8, hc_mult=4, seed=42),
+        dict(name="sinkhorn b=4 s=128", b=4, s=128, hc_mult=4, seed=43),
+    ]
+    for case in sinkhorn_cases:
+        if not _run_sinkhorn_case(device=device, **case):
+            failures += 1
+
+    total = (len(cases) + len(post_cases) + len(big_fuse_cases)
+             + len(sinkhorn_cases))
     if failures:
         print(f"\n{failures}/{total} cases FAILED")
         return 1
