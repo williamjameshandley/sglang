@@ -15,6 +15,7 @@ from sglang.jit_kernel.utils import (
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -139,6 +140,72 @@ def _jit_metadata_module():
     )
 
 
+@register_custom_op(
+    op_name="deepseek_v4_topk_transform_512_v1_page_only_",
+    mutates_args=["out_page_indices"],
+)
+def _topk_transform_512_v1_page_only_(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    _jit_topk_module().topk_transform(
+        scores, seq_lens, page_tables, out_page_indices, page_size, None,
+    )
+
+
+@register_custom_op(
+    op_name="deepseek_v4_topk_transform_512_v1_raw_",
+    mutates_args=["out_page_indices", "out_raw_indices"],
+)
+def _topk_transform_512_v1_raw_(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    out_raw_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    _jit_topk_module().topk_transform(
+        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices,
+    )
+
+
+@register_custom_op(
+    op_name="deepseek_v4_topk_transform_512_v2_page_only_",
+    mutates_args=["out_page_indices"],
+)
+def _topk_transform_512_v2_page_only_(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    _jit_topk_v2_module().topk_transform(
+        scores, seq_lens, page_tables, out_page_indices, page_size, None,
+    )
+
+
+@register_custom_op(
+    op_name="deepseek_v4_topk_transform_512_v2_raw_",
+    mutates_args=["out_page_indices", "out_raw_indices"],
+)
+def _topk_transform_512_v2_raw_(
+    scores: torch.Tensor,
+    seq_lens: torch.Tensor,
+    page_tables: torch.Tensor,
+    out_page_indices: torch.Tensor,
+    out_raw_indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    _jit_topk_v2_module().topk_transform(
+        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices,
+    )
+
+
 def topk_transform_512(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -149,9 +216,41 @@ def topk_transform_512(
     ver: Literal[1, 2] = 1,
 ) -> None:
     """Output to page_indices tensor, optionally also output raw abs position indices"""
-    module = _jit_topk_v2_module() if ver == 2 else _jit_topk_module()
-    module.topk_transform(
-        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+    if ver == 2:
+        if out_raw_indices is None:
+            _topk_transform_512_v2_page_only_(
+                scores, seq_lens, page_tables, out_page_indices, page_size,
+            )
+        else:
+            _topk_transform_512_v2_raw_(
+                scores, seq_lens, page_tables, out_page_indices, out_raw_indices, page_size,
+            )
+    else:
+        if out_raw_indices is None:
+            _topk_transform_512_v1_page_only_(
+                scores, seq_lens, page_tables, out_page_indices, page_size,
+            )
+        else:
+            _topk_transform_512_v1_raw_(
+                scores, seq_lens, page_tables, out_page_indices, out_raw_indices, page_size,
+            )
+
+
+@register_custom_op(
+    op_name="deepseek_v4_hash_topk_fill_",
+    mutates_args=["topk_weights", "topk_ids"],
+)
+def _hash_topk_fill_(
+    router_logits: torch.Tensor,
+    input_ids: torch.Tensor,
+    tid2eid: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    routed_scaling_factor: float,
+) -> None:
+    _jit_hash_topk_module().hash_topk(
+        router_logits, input_ids, tid2eid,
+        topk_weights, topk_ids, routed_scaling_factor,
     )
 
 
@@ -173,14 +272,9 @@ def hash_topk(
     topk_weights = torch.empty(
         (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
     )
-    module = _jit_hash_topk_module()
-    module.hash_topk(
-        router_logits,
-        input_ids,
-        tid2eid,
-        topk_weights,
-        topk_ids,
-        routed_scaling_factor,
+    _hash_topk_fill_(
+        router_logits, input_ids, tid2eid,
+        topk_weights, topk_ids, routed_scaling_factor,
     )
     return topk_weights, topk_ids
 
@@ -264,6 +358,52 @@ def compress_plan(
         return CompressorDecodePlan(compress_ratio, seq_lens)
 
 
+@register_custom_op(
+    op_name="deepseek_v4_compress_forward_decode_fill_",
+    mutates_args=["out"],
+)
+def _compress_forward_decode_fill_(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extra_data: Optional[torch.Tensor],
+    head_dim: int,
+    compress_ratio: int,
+) -> None:
+    _jit_compress_module(
+        head_dim, kv_score_input.dtype, out.dtype, compress_ratio,
+    ).decode(
+        kv_score_buffer, kv_score_input, out, ape, indices, seq_lens, extra_data,
+    )
+
+
+@register_custom_op(
+    op_name="deepseek_v4_compress_forward_prefill_fill_",
+    mutates_args=["out"],
+)
+def _compress_forward_prefill_fill_(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    compress_plan_tensor: torch.Tensor,
+    write_plan_tensor: torch.Tensor,
+    extra_data: Optional[torch.Tensor],
+    head_dim: int,
+    compress_ratio: int,
+) -> None:
+    _jit_compress_module(
+        head_dim, kv_score_input.dtype, out.dtype, compress_ratio,
+    ).prefill(
+        kv_score_buffer, kv_score_input, out, ape, indices,
+        compress_plan_tensor, write_plan_tensor, extra_data,
+    )
+
+
 def compress_forward(
     kv_score_buffer: torch.Tensor,
     kv_score_input: torch.Tensor,
@@ -301,15 +441,70 @@ def compress_forward(
             kv_score_input.device,
         )
     assert plan.compress_ratio == compress_ratio, "Mismatched compress ratio in plan!"
-    module = _jit_compress_module(
-        head_dim,
-        kv_score_input.dtype,
-        out.dtype,
-        compress_ratio,
-    )
-    F = module.decode if isinstance(plan, CompressorDecodePlan) else module.prefill
-    F(kv_score_buffer, kv_score_input, out, ape, indices, *plan[1:], extra_data)
+    if isinstance(plan, CompressorDecodePlan):
+        _compress_forward_decode_fill_(
+            kv_score_buffer, kv_score_input, out, ape, indices,
+            plan.seq_lens, extra_data, head_dim, int(compress_ratio),
+        )
+    else:
+        _compress_forward_prefill_fill_(
+            kv_score_buffer, kv_score_input, out, ape, indices,
+            plan.compress_plan, plan.write_plan,
+            extra_data, head_dim, int(compress_ratio),
+        )
     return out
+
+
+
+
+@register_custom_op(
+    op_name="deepseek_v4_compress_fused_norm_rope_decode_",
+    mutates_args=["kv"],
+)
+def _compress_fused_norm_rope_decode_(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    plan_tensor: torch.Tensor,
+    freq_real: torch.Tensor,
+    eps: float,
+    compress_ratio: int,
+) -> None:
+    _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_real.shape[-1]).forward(
+        kv, weight, plan_tensor, freq_real, 1, eps, compress_ratio,
+    )
+
+
+@register_custom_op(
+    op_name="deepseek_v4_compress_fused_norm_rope_prefill_",
+    mutates_args=["kv"],
+)
+def _compress_fused_norm_rope_prefill_(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    plan_tensor: torch.Tensor,
+    freq_real: torch.Tensor,
+    eps: float,
+    compress_ratio: int,
+) -> None:
+    _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_real.shape[-1]).forward(
+        kv, weight, plan_tensor, freq_real, 0, eps, compress_ratio,
+    )
+
+
+@register_custom_op(
+    op_name="deepseek_v4_fused_norm_rope_",
+    mutates_args=["kv"],
+)
+def _fused_norm_rope_(
+    kv: torch.Tensor,
+    weight: torch.Tensor,
+    positions: torch.Tensor,
+    freq_real: torch.Tensor,
+    eps: float,
+) -> None:
+    _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_real.shape[-1]).forward(
+        kv, weight, positions, freq_real, 2, eps, 0,
+    )
 
 
 def compress_fused_norm_rope_inplace(
@@ -319,17 +514,15 @@ def compress_fused_norm_rope_inplace(
     freq_cis: torch.Tensor,
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
 ) -> None:
-    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
-    module.forward(
-        kv,
-        weight,
-        plan[1],  # decode: seq_lens, prefill: compress_plan
-        freq_cis,
-        1 if isinstance(plan, CompressorDecodePlan) else 0,  # mode
-        eps,
-        plan.compress_ratio,
-    )
+    freq_real = torch.view_as_real(freq_cis).flatten(-2)
+    if isinstance(plan, CompressorDecodePlan):
+        _compress_fused_norm_rope_decode_(
+            kv, weight, plan[1], freq_real, eps, plan.compress_ratio,
+        )
+    else:
+        _compress_fused_norm_rope_prefill_(
+            kv, weight, plan[1], freq_real, eps, plan.compress_ratio,
+        )
 
 
 def fused_norm_rope_inplace(
@@ -339,20 +532,8 @@ def fused_norm_rope_inplace(
     freq_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> None:
-    freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
-    module.forward(
-        kv,
-        weight,
-        positions,
-        freq_cis,
-        2,  # mode
-        eps,
-        0,  # compress_ratio (no use in this mode)
-    )
-
-
-from sglang.srt.utils.custom_op import register_custom_op
+    freq_real = torch.view_as_real(freq_cis).flatten(-2)
+    _fused_norm_rope_(kv, weight, positions, freq_real, eps)
 
 
 @register_custom_op(op_name="deepseek_v4_fused_rope_q_", mutates_args=["q"])
@@ -615,6 +796,42 @@ def triton_create_paged_compress_data(
     return out_0, out_1
 
 
+@register_custom_op(
+    op_name="deepseek_v4_fused_store_cache_flashmla_",
+    mutates_args=["cache"],
+)
+def _fused_store_cache_flashmla_(
+    input: torch.Tensor,
+    cache: torch.Tensor,
+    indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    _jit_fused_store_module(
+        name="flashmla",
+        input_dtype=input.dtype,
+        index_dtype=indices.dtype,
+        page_size=page_size,
+    ).run(input, cache, indices)
+
+
+@register_custom_op(
+    op_name="deepseek_v4_fused_store_cache_indexer_",
+    mutates_args=["cache"],
+)
+def _fused_store_cache_indexer_(
+    input: torch.Tensor,
+    cache: torch.Tensor,
+    indices: torch.Tensor,
+    page_size: int,
+) -> None:
+    _jit_fused_store_module(
+        name="indexer",
+        input_dtype=input.dtype,
+        index_dtype=indices.dtype,
+        page_size=page_size,
+    ).run(input, cache, indices)
+
+
 def fused_store_cache(
     input: torch.Tensor,
     cache: torch.Tensor,
@@ -623,13 +840,12 @@ def fused_store_cache(
     page_size: int,
     type: Literal["flashmla", "indexer"],
 ) -> None:
-    module = _jit_fused_store_module(
-        name=type,
-        input_dtype=input.dtype,
-        index_dtype=indices.dtype,
-        page_size=page_size,
-    )
-    module.run(input, cache, indices)
+    if type == "flashmla":
+        _fused_store_cache_flashmla_(input, cache, indices, page_size)
+    elif type == "indexer":
+        _fused_store_cache_indexer_(input, cache, indices, page_size)
+    else:
+        raise ValueError(f"unknown fused_store_cache type {type!r}")
 
 
 @cache_once
@@ -644,6 +860,45 @@ def _jit_silu_mul_quant_module(
         *args,
         cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
         cuda_wrappers=[("run", f"SiluAndMulMaskedPostQuantKernel<{args}>::run")],
+    )
+
+
+@register_custom_op(
+    op_name="deepseek_v4_silu_mul_quant_plain_",
+    mutates_args=["output", "output_scale"],
+)
+def _silu_mul_quant_plain_(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    quant_group_size: int,
+    scale_ue8m0: bool,
+    topk: int,
+    transposed: bool,
+) -> None:
+    _jit_silu_mul_quant_module(quant_group_size, scale_ue8m0, False).run(
+        input, output, output_scale, masked_m, topk, transposed, 0.0,
+    )
+
+
+@register_custom_op(
+    op_name="deepseek_v4_silu_mul_quant_swiglu_",
+    mutates_args=["output", "output_scale"],
+)
+def _silu_mul_quant_swiglu_(
+    input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    quant_group_size: int,
+    scale_ue8m0: bool,
+    topk: int,
+    transposed: bool,
+    swiglu_limit: float,
+) -> None:
+    _jit_silu_mul_quant_module(quant_group_size, scale_ue8m0, True).run(
+        input, output, output_scale, masked_m, topk, transposed, swiglu_limit,
     )
 
 
@@ -670,29 +925,35 @@ def silu_and_mul_masked_post_quant(
                         When set, JIT-compiles a separate kernel variant that clamps gate to
                         [-inf, L] and up to [-L, L] before silu (fused).
     """
-    apply_swiglu_limit = swiglu_limit is not None
-    if apply_swiglu_limit:
+    if swiglu_limit is None:
+        _silu_mul_quant_plain_(
+            input, output, output_scale, masked_m,
+            quant_group_size, scale_ue8m0, topk, transposed,
+        )
+    else:
         deepseek_v4_moe_code_path_checker.observed += 1
-    module = _jit_silu_mul_quant_module(
-        quant_group_size, scale_ue8m0, apply_swiglu_limit
-    )
-    module.run(
-        input,
-        output,
-        output_scale,
-        masked_m,
-        topk,
-        transposed,
-        float(swiglu_limit) if apply_swiglu_limit else 0.0,
-    )
+        _silu_mul_quant_swiglu_(
+            input, output, output_scale, masked_m,
+            quant_group_size, scale_ue8m0, topk, transposed, float(swiglu_limit),
+        )
+
+
+@register_custom_op(
+    op_name="deepseek_v4_paged_mqa_logits_metadata_fill_",
+    mutates_args=["metadata"],
+)
+def _paged_mqa_logits_metadata_fill_(
+    seq_lens: torch.Tensor,
+    metadata: torch.Tensor,
+) -> None:
+    _jit_metadata_module().run(seq_lens, metadata)
 
 
 def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm: int):
     assert page_size == 64
     seq_lens = seq_lens.to(torch.int32)
     metadata = seq_lens.new_empty(num_sm + 1, 2)
-    module = _jit_metadata_module()
-    module.run(seq_lens, metadata)
+    _paged_mqa_logits_metadata_fill_(seq_lens, metadata)
     return metadata
 
 
