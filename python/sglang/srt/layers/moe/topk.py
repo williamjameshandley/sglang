@@ -267,6 +267,7 @@ def empty_triton_kernels_topk_output(
     )
 
 
+@torch.compiler.allow_in_graph
 def to_triton_kernels_format(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
