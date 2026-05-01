@@ -1365,7 +1365,15 @@ def _capture_trace_once(name: str, spec, warmed=None, phase: str = "enter"):
     Caller must call once at entry (`phase="enter"`) and once after the
     kernel launch (`phase="exit"`); a missing exit while the enter ran
     under capture means the wrapper raised between the two.
+
+    No-op under Dynamo/PCG trace — `torch.cuda.is_current_stream_capturing()`
+    returns `bool`, which Dynamo can't lift into the FX graph. The
+    instrumentation is for eager-vs-CUDA-graph diagnostics; PCG warmup
+    runs through Dynamo first, where the tracing helper itself would
+    derail the compile.
     """
+    if torch._dynamo.is_compiling():
+        return False
     import sys
     capturing = torch.cuda.is_current_stream_capturing()
     key = (name, spec, capturing, phase)
