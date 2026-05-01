@@ -79,7 +79,7 @@ def _is_sm120() -> bool:
     return major == 12
 
 
-def _triton_supported(
+def _triton_supported_reason(
     *,
     q,
     k_cache,
@@ -95,111 +95,92 @@ def _triton_supported(
     topk_length,
     indices,
     head_dim_v,
-) -> bool:
-    """Full Phase 6.2 Triton-wrapper precondition check.
-
-    Mirrors the asserts in `flash_mla_with_kvcache_triton_sm120` so the
-    dispatcher routes any unsupported call elsewhere instead of letting
-    it land on a hard assert. Wrapper still asserts as defence-in-depth.
-    """
-    if q is None or q.ndim != 4:
-        return False
-    if k_cache is None or k_cache.ndim != 4:
-        return False
-    # Compressed scope: all three must be present together (Phase 6.7) or
-    # all three None (Phase 6.2 SWA-only).
+) -> Optional[str]:
+    """Returns None if Triton kernel preconditions hold, else a string
+    naming the first failed precondition (for PCG diagnostic logging)."""
+    if q is None: return "q is None"
+    if q.ndim != 4: return f"q.ndim={q.ndim} != 4"
+    if k_cache is None: return "k_cache is None"
+    if k_cache.ndim != 4: return f"k_cache.ndim={k_cache.ndim} != 4"
     if extra_k_cache is None:
-        if extra_indices_in_kvcache is not None or extra_topk_length is not None:
-            return False
+        if extra_indices_in_kvcache is not None:
+            return "extra_k_cache is None but extra_indices_in_kvcache is not None"
+        if extra_topk_length is not None:
+            return "extra_k_cache is None but extra_topk_length is not None"
     else:
-        if extra_indices_in_kvcache is None or extra_topk_length is None:
-            return False
-        if extra_k_cache.ndim != 4:
-            return False
-        if extra_k_cache.shape[2] != 1 or extra_k_cache.shape[3] != 584:
-            return False
-        if extra_k_cache.dtype != torch.uint8:
-            return False
+        if extra_indices_in_kvcache is None: return "extra_indices_in_kvcache is None with extra_k_cache present"
+        if extra_topk_length is None: return "extra_topk_length is None with extra_k_cache present"
+        if extra_k_cache.ndim != 4: return f"extra_k_cache.ndim={extra_k_cache.ndim} != 4"
+        if extra_k_cache.shape[2] != 1: return f"extra_k_cache.shape[2]={extra_k_cache.shape[2]} != 1"
+        if extra_k_cache.shape[3] != 584: return f"extra_k_cache.shape[3]={extra_k_cache.shape[3]} != 584"
+        if extra_k_cache.dtype != torch.uint8: return f"extra_k_cache.dtype={extra_k_cache.dtype} != uint8"
         e_page_stride = extra_k_cache.stride(0) * extra_k_cache.element_size()
         P_extra = extra_k_cache.shape[1]
-        if e_page_stride % 576 != 0 or e_page_stride < P_extra * 584:
-            return False
-        if extra_indices_in_kvcache.ndim != 3:
-            return False
-        if extra_indices_in_kvcache.shape[0] != q.shape[0]:
-            return False
-        if extra_indices_in_kvcache.shape[1] != 1:
-            return False
-        if extra_indices_in_kvcache.shape[-1] % 64 != 0:
-            return False
-        if extra_indices_in_kvcache.dtype != torch.int32:
-            return False
-        if extra_indices_in_kvcache.stride(2) != 1:
-            return False
-        if extra_topk_length.ndim != 1:
-            return False
-        if extra_topk_length.shape != (q.shape[0],):
-            return False
-        if extra_topk_length.dtype != torch.int32:
-            return False
-        if not (extra_k_cache.is_cuda and extra_indices_in_kvcache.is_cuda
-                and extra_topk_length.is_cuda):
-            return False
-        if not (extra_k_cache.device == q.device
-                and extra_indices_in_kvcache.device == q.device
-                and extra_topk_length.device == q.device):
-            return False
-    if not (q.shape[1] == 1 and q.shape[2] % 16 == 0):
-        return False
-    if q.shape[3] != 512 or head_dim_v != 512:
-        return False
-    if q.dtype != torch.bfloat16:
-        return False
-    if q.stride(3) != 1:
-        return False
-    if k_cache.dtype != torch.uint8:
-        return False
-    if k_cache.shape[2] != 1 or k_cache.shape[3] != 584:
-        return False
+        if e_page_stride % 576 != 0: return f"extra_k_cache page_byte_stride={e_page_stride} % 576 != 0"
+        if e_page_stride < P_extra * 584: return f"extra_k_cache page_byte_stride={e_page_stride} < P_extra*584={P_extra*584}"
+        if extra_indices_in_kvcache.ndim != 3: return f"extra_indices_in_kvcache.ndim={extra_indices_in_kvcache.ndim} != 3"
+        if extra_indices_in_kvcache.shape[0] != q.shape[0]: return f"extra_indices_in_kvcache.shape[0]={extra_indices_in_kvcache.shape[0]} != q.shape[0]={q.shape[0]}"
+        if extra_indices_in_kvcache.shape[1] != 1: return f"extra_indices_in_kvcache.shape[1]={extra_indices_in_kvcache.shape[1]} != 1"
+        if extra_indices_in_kvcache.shape[-1] % 64 != 0: return f"extra_indices_in_kvcache.shape[-1]={extra_indices_in_kvcache.shape[-1]} % 64 != 0"
+        if extra_indices_in_kvcache.dtype != torch.int32: return f"extra_indices_in_kvcache.dtype={extra_indices_in_kvcache.dtype} != int32"
+        if extra_indices_in_kvcache.stride(2) != 1: return f"extra_indices_in_kvcache.stride(2)={extra_indices_in_kvcache.stride(2)} != 1"
+        if extra_topk_length.ndim != 1: return f"extra_topk_length.ndim={extra_topk_length.ndim} != 1"
+        if extra_topk_length.shape != (q.shape[0],): return f"extra_topk_length.shape={tuple(extra_topk_length.shape)} != ({q.shape[0]},)"
+        if extra_topk_length.dtype != torch.int32: return f"extra_topk_length.dtype={extra_topk_length.dtype} != int32"
+        if not extra_k_cache.is_cuda: return "extra_k_cache not CUDA"
+        if not extra_indices_in_kvcache.is_cuda: return "extra_indices_in_kvcache not CUDA"
+        if not extra_topk_length.is_cuda: return "extra_topk_length not CUDA"
+        if extra_k_cache.device != q.device: return f"extra_k_cache.device={extra_k_cache.device} != q.device={q.device}"
+        if extra_indices_in_kvcache.device != q.device: return f"extra_indices_in_kvcache.device != q.device"
+        if extra_topk_length.device != q.device: return f"extra_topk_length.device != q.device"
+    if q.shape[1] != 1: return f"q.shape[1]={q.shape[1]} != 1 (s_q must be 1; Contract A flattens)"
+    if q.shape[2] % 16 != 0: return f"q.shape[2]={q.shape[2]} % 16 != 0 (h_q)"
+    if q.shape[3] != 512: return f"q.shape[3]={q.shape[3]} != 512 (head_dim_qk)"
+    if head_dim_v != 512: return f"head_dim_v={head_dim_v} != 512"
+    if q.dtype != torch.bfloat16: return f"q.dtype={q.dtype} != bfloat16"
+    if q.stride(3) != 1: return f"q.stride(3)={q.stride(3)} != 1"
+    if k_cache.dtype != torch.uint8: return f"k_cache.dtype={k_cache.dtype} != uint8"
+    if k_cache.shape[2] != 1: return f"k_cache.shape[2]={k_cache.shape[2]} != 1"
+    if k_cache.shape[3] != 584: return f"k_cache.shape[3]={k_cache.shape[3]} != 584"
     P = k_cache.shape[1]
     page_byte_stride = k_cache.stride(0) * k_cache.element_size()
-    if page_byte_stride % 576 != 0:
-        return False
-    if page_byte_stride < P * 584:
-        return False
-    if is_fp8_kvcache is not True:
-        return False
-    # Phase 7.3: supported set is {1, 2, 4, 8}. Larger values would cause
-    # the merge kernel to materialize an unmanageable [NUM_SPLITS, BLOCK_M,
-    # BLOCK_DV] tile; redesign to stream-over-splits is required before
-    # accepting a wider domain.
+    if page_byte_stride % 576 != 0: return f"k_cache page_byte_stride={page_byte_stride} % 576 != 0"
+    if page_byte_stride < P * 584: return f"k_cache page_byte_stride={page_byte_stride} < P*584={P*584}"
+    if is_fp8_kvcache is not True: return f"is_fp8_kvcache={is_fp8_kvcache} (must be True)"
     if num_splits is not None and num_splits not in (1, 2, 4, 8):
-        return False
-    if block_table is not None or cache_seqlens is not None:
-        return False
-    if causal:
-        return False
-    if attn_sink is None or attn_sink.shape != (q.shape[2],):
-        return False
-    if topk_length is None or topk_length.ndim != 1:
-        return False
-    if topk_length.shape != (q.shape[0],) or topk_length.dtype != torch.int32:
-        return False
-    if indices is None or indices.ndim != 3:
-        return False
-    if indices.shape[0] != q.shape[0] or indices.shape[1] != 1:
-        return False
-    if indices.shape[-1] % 64 != 0 or indices.dtype != torch.int32:
-        return False
-    if indices.stride(2) != 1:
-        return False
-    if not (q.is_cuda and k_cache.is_cuda and indices.is_cuda
-            and topk_length.is_cuda and attn_sink.is_cuda):
-        return False
-    if not (q.device == k_cache.device == indices.device
-            == topk_length.device == attn_sink.device):
-        return False
-    return True
+        return f"num_splits={num_splits} not in (None, 1, 2, 4, 8)"
+    if block_table is not None: return "block_table is not None (sparse-MLA path requires None)"
+    if cache_seqlens is not None: return "cache_seqlens is not None"
+    if causal: return "causal=True (sparse-MLA path requires causal=False)"
+    if attn_sink is None: return "attn_sink is None"
+    if attn_sink.shape != (q.shape[2],): return f"attn_sink.shape={tuple(attn_sink.shape)} != ({q.shape[2]},)"
+    if topk_length is None: return "topk_length is None"
+    if topk_length.ndim != 1: return f"topk_length.ndim={topk_length.ndim} != 1"
+    if topk_length.shape != (q.shape[0],): return f"topk_length.shape={tuple(topk_length.shape)} != ({q.shape[0]},)"
+    if topk_length.dtype != torch.int32: return f"topk_length.dtype={topk_length.dtype} != int32"
+    if indices is None: return "indices is None"
+    if indices.ndim != 3: return f"indices.ndim={indices.ndim} != 3"
+    if indices.shape[0] != q.shape[0]: return f"indices.shape[0]={indices.shape[0]} != q.shape[0]={q.shape[0]}"
+    if indices.shape[1] != 1: return f"indices.shape[1]={indices.shape[1]} != 1"
+    if indices.shape[-1] % 64 != 0: return f"indices.shape[-1]={indices.shape[-1]} % 64 != 0"
+    if indices.dtype != torch.int32: return f"indices.dtype={indices.dtype} != int32"
+    if indices.stride(2) != 1: return f"indices.stride(2)={indices.stride(2)} != 1"
+    if not q.is_cuda: return "q not CUDA"
+    if not k_cache.is_cuda: return "k_cache not CUDA"
+    if not indices.is_cuda: return "indices not CUDA"
+    if not topk_length.is_cuda: return "topk_length not CUDA"
+    if not attn_sink.is_cuda: return "attn_sink not CUDA"
+    if q.device != k_cache.device: return f"q.device={q.device} != k_cache.device={k_cache.device}"
+    if q.device != indices.device: return f"q.device != indices.device"
+    if q.device != topk_length.device: return f"q.device != topk_length.device"
+    if q.device != attn_sink.device: return f"q.device != attn_sink.device"
+    return None
+
+
+def _triton_supported(**kwargs) -> bool:
+    """Bool wrapper around `_triton_supported_reason` for callers that
+    don't need diagnostic strings."""
+    return _triton_supported_reason(**kwargs) is None
 
 
 def _torch_supported(
@@ -267,7 +248,7 @@ def get_sparse_mla_decode_backend(
         return SparseMLADecodeBackend.TORCH
 
     if _is_sm120():
-        if _triton_supported(
+        triton_reason = _triton_supported_reason(
             q=q, k_cache=k_cache, extra_k_cache=extra_k_cache,
             extra_indices_in_kvcache=extra_indices_in_kvcache,
             extra_topk_length=extra_topk_length,
@@ -276,8 +257,20 @@ def get_sparse_mla_decode_backend(
             is_fp8_kvcache=is_fp8_kvcache, attn_sink=attn_sink,
             topk_length=topk_length, indices=indices,
             head_dim_v=head_dim_v,
-        ):
+        )
+        if triton_reason is None:
             return SparseMLADecodeBackend.TRITON_SM120
+        # Triton precondition failed. Under Dynamo/PCG compile, the TORCH
+        # fallback is graph-hostile (Python reference calls method on an
+        # untraceable kvcache_layout object) — fail loud with the exact
+        # reason rather than letting the fallback explode inside Dynamo.
+        if torch._dynamo.is_compiling():
+            raise RuntimeError(
+                "sm_120 sparse-MLA Triton precondition failed during "
+                f"Dynamo/PCG compile: {triton_reason}. "
+                "TORCH fallback is not PCG-safe; fix the metadata/shape "
+                "so _triton_supported holds."
+            )
         if not _torch_supported(
             num_splits=num_splits, block_table=block_table,
             cache_seqlens=cache_seqlens, causal=causal,
@@ -285,7 +278,8 @@ def get_sparse_mla_decode_backend(
         ):
             raise NotImplementedError(
                 "sparse-MLA decode call has features unsupported by both "
-                "the sm_120 Triton path and the torch fallback"
+                f"the sm_120 Triton path ({triton_reason}) and the torch "
+                "fallback"
             )
         return SparseMLADecodeBackend.TORCH
 
