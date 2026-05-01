@@ -313,8 +313,15 @@ def to_triton_kernels_format(
     # capture. Skip the sanity checks while capturing — by that point the
     # graph is already capturing identical kernel launches that have been
     # validated outside capture. The `is_cuda` short-circuit avoids a
-    # capture-state query when the tensors are CPU.
-    if not (topk_ids.is_cuda and torch.cuda.is_current_stream_capturing()):
+    # capture-state query when the tensors are CPU. Also skip under
+    # Dynamo/PCG trace: `is_current_stream_capturing` returns bool and
+    # cannot be lifted into the Dynamo FX graph; the asserts themselves
+    # invoke `.item()` which would graph-break too.
+    if torch._dynamo.is_compiling():
+        skip_checks = True
+    else:
+        skip_checks = topk_ids.is_cuda and torch.cuda.is_current_stream_capturing()
+    if not skip_checks:
         assert (
             topk_ids.min().item() >= 0
         ), "to_triton_kernels_format requires topk_ids >= 0 (no -1 padded sentinels)"
