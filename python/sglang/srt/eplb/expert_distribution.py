@@ -229,6 +229,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
     def _on_hook(self, hook_name: str, **kwargs):
         if self._disable_all:
             return
+        # is_current_stream_capturing is bool-returning; under Dynamo/PCG
+        # trace this hook is a no-op (recording+capture are real-runtime
+        # signals, not relevant during graph construction).
+        if torch._dynamo.is_compiling():
+            return
         if not (
             self._recording or torch.get_device_module().is_current_stream_capturing()
         ):

@@ -308,7 +308,11 @@ class CustomAllreduce:
         if self.disabled or not self.should_custom_ar(input):
             return None
         if self._IS_CAPTURING:
-            if torch.cuda.is_current_stream_capturing():
+            # Under Dynamo/PCG trace `is_current_stream_capturing` is a
+            # bool-returning torch op Dynamo refuses to lift into the FX
+            # graph; PCG capture wraps the trace pass with `_IS_CAPTURING`
+            # set, so treat traced as "real capture" semantics.
+            if torch._dynamo.is_compiling() or torch.cuda.is_current_stream_capturing():
                 return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.

@@ -274,7 +274,11 @@ class PyMscclppCommunicator:
         return True
 
     def all_reduce(self, tensor: torch.Tensor, op: ReduceOp = ReduceOp.SUM):
-        if self._IS_CAPTURING:
+        if self._IS_CAPTURING and not torch._dynamo.is_compiling():
+            # is_current_stream_capturing returns bool; Dynamo can't lift
+            # it into the FX graph (gb0208). The graph_input_set tracking
+            # is a real-capture book-keeping side-effect, not relevant
+            # during the Dynamo trace pass.
             if torch.cuda.is_current_stream_capturing():
                 self.graph_input_set.add((tensor.dtype, tensor.numel()))
         msg_size = tensor.numel() * tensor.itemsize
