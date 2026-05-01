@@ -1030,12 +1030,20 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             assert swa_k_cache.ndim == 2
             # view b/c flashmla expect dim=4
             # reference: FlashMLA/tests/test_flash_mla_sparse_prefill.py
+            # The pool's get_key_buffer views the raw uint8 storage as
+            # float8_e4m3fn; the sm_120 Triton sparse-MLA kernel expects
+            # raw uint8 bytes (NoPE+RoPE+UE8M0 byte-packed). Reinterpret
+            # back to uint8 — zero-cost since storage is uint8 anyway.
+            # The torch fallback re-views as FP8_DTYPE internally, so
+            # this view is correct for both backends.
+            swa_k_cache = swa_k_cache.view(torch.uint8)
             k_cache_total_dim = token_to_kv_pool.swa_kv_pool.kv_cache_total_dim
             swa_k_cache = swa_k_cache[:, : swa_window_size * k_cache_total_dim].view(
                 swa_k_cache.shape[0], swa_window_size, 1, k_cache_total_dim
             )
 
             if extra_k_cache is not None:
+                extra_k_cache = extra_k_cache.view(torch.uint8)
                 page_sizes = {
                     4: token_to_kv_pool.page_size // 4,
                     128: token_to_kv_pool.page_size // 128,
