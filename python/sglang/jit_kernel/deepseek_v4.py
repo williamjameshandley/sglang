@@ -2307,7 +2307,7 @@ def flash_mla_with_kvcache_triton_sm120(
     HEAD_DIM_NOPE = 448
     HEAD_DIM_ROPE = 64
     HEAD_DIM_QK = 512
-    BLOCK_DV = 256
+    BLOCK_DV = 128
     assert HEAD_DIM_QK % BLOCK_DV == 0
 
     # The kernel reads attn_sink and upcasts to fp32 internally
