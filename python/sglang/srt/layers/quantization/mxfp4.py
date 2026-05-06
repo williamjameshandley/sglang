@@ -988,29 +988,45 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         backend = self.runner.runner_backend
         if backend.is_triton_kernels():
-            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
-                TritonKernelsQuantInfo,
-            )
-
+            # Bypass MoeRunner.run / pre_permute_standard_to_triton_kernels
+            # to keep RoutingData / SparseMatrix / PrecisionConfig out of
+            # the captured forward graph (Phase 7.4.10 boundary refactor).
+            # The per-layer custom op registered in
+            # `_maybe_register_deepseek_v4_moe_pcg_op` is opaque to Dynamo
+            # under fullgraph=True; the triton_kernels Python objects
+            # live and die inside its body.
             assert (
                 layer.moe_ep_size == 1
             ), "Expert parallel is not supported when using triton kernels"
-            quant_info = TritonKernelsQuantInfo(
-                w13_weight=(
-                    self.w13_weight_triton_tensor
-                    if self.w13_weight_triton_tensor is not None
-                    else layer.w13_weight
-                ),
-                w2_weight=(
-                    self.w2_weight_triton_tensor
-                    if self.w2_weight_triton_tensor is not None
-                    else layer.w2_weight
-                ),
-                w13_bias=getattr(layer, "w13_weight_bias", None),
-                w2_bias=getattr(layer, "w2_weight_bias", None),
-                w13_precision_config=getattr(self, "w13_precision_config", None),
-                w2_precision_config=getattr(self, "w2_precision_config", None),
+            assert (
+                getattr(layer, "w13_weight_bias", None) is None
+                and getattr(layer, "w2_weight_bias", None) is None
+            ), "PCG path does not support biased routed experts"
+            assert (
+                not self.moe_runner_config.no_combine
+            ), "PCG path requires no_combine=False"
+            assert TopKOutputChecker.format_is_standard(topk_output), (
+                "PCG path requires StandardTopKOutput "
+                "(Phase 7.4.10 Decision B)"
             )
+            assert getattr(layer, "deepseek_v4_moe_pcg_op", None) is not None, (
+                "deepseek_v4_moe_pcg_op missing on layer; "
+                "_maybe_register_deepseek_v4_moe_pcg_op did not run"
+            )
+
+            topk_weights, topk_ids, router_logits = topk_output
+            output = layer.deepseek_v4_moe_pcg_op(
+                x, topk_weights, topk_ids, router_logits,
+            )
+
+            # Preserve runner-side routed_scaling_factor that
+            # `post_permute_triton_kernels_to_standard` (which we
+            # bypassed) would have applied. HIGH numerical correctness
+            # item — V4-Flash uses routed_scaling_factor=2.5.
+            rsf = self.moe_runner_config.routed_scaling_factor
+            if rsf is not None and rsf != 1.0:
+                output = output * rsf
+            return StandardCombineInput(hidden_states=output)
         else:
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,
