@@ -70,13 +70,15 @@ class HashTopK(nn.Module):
 
     def empty_topk_output(self, device: torch.device):
         topk = self.topk - self.num_fused_shared_experts
+        # Phase 7.4.10: triton_kernels backend uses StandardTopKOutput
+        # universally so the captured forward never sees TritonKernelTopKOutput.
+        # The triton_kernels-specific RoutingData/SparseMatrix/etc lives
+        # inside the per-layer custom op (Mxfp4MoEMethod._maybe_register_*)
+        # at runtime, not in the FX graph.
         if get_moe_runner_backend().is_triton_kernels():
             assert self.num_fused_shared_experts == 0, (
                 "HashTopK->TritonKernel conversion does not support "
                 "fused shared experts"
-            )
-            return empty_triton_kernels_topk_output(
-                n_expts_tot=self.num_experts, n_expts_act=topk, device=device
             )
         topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
@@ -165,32 +167,28 @@ class HashTopK(nn.Module):
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
 
+        # Phase 7.4.10: triton_kernels backend returns StandardTopKOutput
+        # too. The triton_kernels-specific RoutingData/SparseMatrix/etc
+        # construction lives inside the per-layer custom op registered
+        # by Mxfp4MoEMethod._maybe_register_deepseek_v4_moe_pcg_op so it
+        # never crosses the captured forward's FX graph boundary.
         if get_moe_runner_backend().is_triton_kernels():
             assert self.num_fused_shared_experts == 0, (
-                "HashTopK->TritonKernel conversion does not support fused "
+                "HashTopK->TritonKernel path does not support fused "
                 "shared experts (IDs >= n_routed_experts)"
             )
-            # The helper's contract requires already-postprocessed topk_ids
-            # (no -1 sentinels, no logical-vs-physical mismatch). Padded
-            # masking and EPLB remap above already ran; if either argument
-            # was non-None these would have introduced sentinels we cannot
-            # represent. Reject loudly.
+            # Per-layer custom op's internal to_triton_kernels_format(...)
+            # still cannot consume -1 sentinels or logical/physical
+            # mismatches; preserve the existing pre-PCG guards.
             assert num_token_non_padded is None, (
-                "HashTopK->TritonKernel conversion does not support "
+                "HashTopK->TritonKernel path does not support "
                 "padded-region masking; -1 indices in topk_ids would "
                 "corrupt the bitmatrix"
             )
             assert expert_location_dispatch_info is None, (
-                "HashTopK->TritonKernel conversion does not support EPLB; "
+                "HashTopK->TritonKernel path does not support EPLB; "
                 "router_logits columns are logical, gathering via physical "
                 "IDs would index wrong columns"
-            )
-            return to_triton_kernels_format(
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                router_logits=router_logits,
-                n_expts_tot=router_logits.shape[-1],
-                n_expts_act=topk_weights.shape[-1],
             )
 
         return StandardTopKOutput(

@@ -511,27 +511,25 @@ class TopK(MultiPlatformOp):
             output_format = TopKOutputFormat.STANDARD
 
         if output_format == TopKOutputFormat.TRITON_KERNEL:
-            # Delegate to `select_experts` (which honors the full TopKConfig
-            # — noaux_tc, biased_grouped_topk, EPLB remap, padded masking,
-            # etc.) and convert its StandardTopKOutput to a
-            # TritonKernelTopKOutput. `to_triton_kernels_format` pads
-            # n_expts_act to a power of two for the `_topk_forward` kernel.
-            #
-            # to_triton_kernels_format cannot represent fused shared
-            # expert IDs >= n_routed_experts; guard that here.
+            # Phase 7.4.10: triton_kernels backend returns
+            # StandardTopKOutput. The triton_kernels-specific
+            # SparseMatrix/RoutingData/GatherIndx/ScatterIndx
+            # construction lives inside the per-layer custom op
+            # registered by Mxfp4MoEMethod._maybe_register_deepseek_v4_moe_pcg_op
+            # so it never crosses the captured forward's FX graph
+            # boundary.
             assert self.topk_config.num_fused_shared_experts == 0, (
                 "TRITON_KERNEL TopK does not support "
                 "num_fused_shared_experts > 0 "
                 "(IDs >= router_logits.shape[-1] would index out of range)"
             )
-            # `select_experts` writes -1 into `topk_ids` for padded-region
-            # rows; `to_triton_kernels_format` cannot consume those. Reject
-            # the masked-padding case explicitly until the v3.6.0 `n_rows`
-            # path is plumbed through.
+            # The custom op's internal to_triton_kernels_format(...) still
+            # cannot consume -1 sentinels from padded-region masking; keep
+            # the guard.
             assert num_token_non_padded is None, (
                 "TRITON_KERNEL TopK does not currently support padded-region "
                 "masking; -1 expert IDs would be rejected by "
-                "to_triton_kernels_format"
+                "to_triton_kernels_format inside the per-layer custom op"
             )
 
             self.topk_config.torch_native = False
@@ -546,12 +544,10 @@ class TopK(MultiPlatformOp):
                     num_token_non_padded=num_token_non_padded,
                     expert_location_dispatch_info=expert_location_dispatch_info,
                 )
-            return to_triton_kernels_format(
+            return StandardTopKOutput(
                 topk_weights=std.topk_weights.to(torch.float32),
                 topk_ids=std.topk_ids.to(torch.int32),
                 router_logits=std.router_logits,
-                n_expts_tot=std.router_logits.shape[-1],
-                n_expts_act=std.topk_weights.shape[-1],
             )
         elif output_format == TopKOutputFormat.BYPASSED:
             return BypassedTopKOutput(
@@ -615,6 +611,8 @@ class TopK(MultiPlatformOp):
 
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
+        # Phase 7.4.10: triton_kernels backend uses StandardTopKOutput
+        # (no TritonKernelTopKOutput in any captured forward path).
         if get_moe_runner_backend().is_triton_kernels():
             assert self.topk_config.num_experts is not None, (
                 "TopK.empty_topk_output under triton_kernels backend "
@@ -623,11 +621,6 @@ class TopK(MultiPlatformOp):
             assert self.topk_config.num_fused_shared_experts == 0, (
                 "TRITON_KERNEL TopK does not support "
                 "num_fused_shared_experts > 0"
-            )
-            return empty_triton_kernels_topk_output(
-                n_expts_tot=self.topk_config.num_experts,
-                n_expts_act=topk,
-                device=device,
             )
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
