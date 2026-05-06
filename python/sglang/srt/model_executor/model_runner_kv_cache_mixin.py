@@ -713,9 +713,11 @@ class ModelRunnerKVCacheMixin:
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                assert (
-                    self.token_to_kv_pool_allocator.__class__
-                    == SWATokenToKVPoolAllocator
+                # Accept subclasses (e.g. DeepSeekV4TokenToKVPoolAllocator
+                # subclasses SWATokenToKVPoolAllocator and provides the same
+                # full_to_swa_index_mapping attribute).
+                assert isinstance(
+                    self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator
                 )
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
                     self.token_to_kv_pool_allocator.full_to_swa_index_mapping
