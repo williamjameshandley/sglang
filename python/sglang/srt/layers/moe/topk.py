@@ -66,9 +66,9 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe import get_moe_runner_backend
-from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.layers.moe.utils import is_deepep_class_backend
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -97,7 +97,7 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
-if _is_cuda or _is_musa:
+if _is_cuda:
     from sgl_kernel import moe_fused_gate
 
     try:
@@ -140,7 +140,7 @@ if _is_cuda or _is_musa:
     except ImportError as e:
         pass
 
-if _is_cuda or _is_hip or _is_xpu or _is_musa:
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import topk_softmax
 
     try:
@@ -153,6 +153,13 @@ if _use_aiter:
         from aiter.fused_moe import fused_topk as aiter_fused_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+if _is_musa:
+    try:
+        from mate import moe_fused_gate
+    except ImportError as e:
+        raise ImportError("mate is required for the biased grouped topk.")
+
+    from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax
 
 # -------------------------------- TopKConfig ---------------------------------------
 
@@ -1098,7 +1105,7 @@ def biased_grouped_topk_gpu(
         return topk_weights, topk_ids
 
     elif (
-        (_is_cuda or _is_musa)
+        _is_cuda
         # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and experts_per_group <= 32
         and is_power_of_two(num_experts)
@@ -1136,6 +1143,21 @@ def biased_grouped_topk_gpu(
             routed_scaling_factor if routed_scaling_factor is not None else 1.0,
         )
         return topk_weights, topk_ids
+    elif _is_musa and (
+        gating_output.shape[1] // num_expert_group <= 32
+        or (num_expert_group == 1 and gating_output.shape[1] in {160, 256, 384})
+    ):
+        topk_weights, topk_ids = moe_fused_gate(
+            gating_output.to(dtype=torch.float32),
+            correction_bias,
+            num_expert_group,
+            topk_group,
+            topk,
+            num_fused_shared_experts,
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            True,
+            apply_routed_scaling_factor_on_output,
+        )
     else:
         # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
@@ -1286,10 +1308,11 @@ def _post_process_topk_ids(
     # Side-effect Python hook; fullgraph=True rejects it. Skip under
     # Dynamo/PCG trace; eager-mode capture/debug still works.
     if not torch._dynamo.is_compiling():
-        get_global_experts_capturer().capture(
-            layer_id=layer_id,
-            topk_ids=topk_ids,
-        )
+        if (cap := get_global_experts_capturer()) is not None:
+            cap.capture(
+                layer_id=layer_id,
+                topk_indices=topk_ids,
+            )
     if _is_cuda:
         # When shared experts are fused (appended as extra columns in topk_ids),
         # EPLB dispatch must only remap the routed expert columns.

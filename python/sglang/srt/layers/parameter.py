@@ -29,18 +29,13 @@ _is_cpu = is_cpu()
 
 
 def _dtype_rank(dtype: torch.dtype) -> Optional[int]:
-    fp8_variants = (
+    if dtype in (
         torch.float8_e4m3fn,
         torch.float8_e4m3fnuz,
         torch.float8_e5m2,
         torch.float8_e5m2fnuz,
-    )
-    # E8M0 (8-bit exponent only) used as a block-scale dtype on
-    # DeepSeek-V4-Flash and other ue8m0-scaled FP8 checkpoints. Treat as an
-    # FP8 variant so it can upcast to fp16/bf16/fp32 scale tensors that
-    # individual layer methods may have allocated.
-    e8m0 = getattr(torch, "float8_e8m0fnu", None)
-    if dtype in fp8_variants or (e8m0 is not None and dtype == e8m0):
+        torch.float8_e8m0fnu,
+    ):
         return 0
     if dtype in (torch.float16, torch.bfloat16):
         return 1

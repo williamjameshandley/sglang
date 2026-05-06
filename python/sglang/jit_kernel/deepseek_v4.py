@@ -9,13 +9,21 @@ import triton.language as tl
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
+from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
+
+_is_hip = is_hip()
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -203,6 +211,11 @@ def topk_transform_512(
     `ver=2` does not support `out_raw_indices` — the C++ wrapper at
     csrc/deepseek_v4/topk_v2.cuh:347-374 rejects a non-None sixth arg.
     """
+    if is_hip_runtime():
+        torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
+            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        )
+        return
     if ver == 2:
         if out_raw_indices is not None:
             raise NotImplementedError(
@@ -1028,6 +1041,8 @@ def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         z = x.new_empty(x.size(0), y.size(0), dtype=torch.float32)
         deep_gemm.bf16_gemm_nt(x, y, z)
         return z
+    elif _use_aiter:
+        return tgemm.mm(x, y, otype=x.dtype).float()
     else:  # fall back to torch fp32 GEMM
         return torch.nn.functional.linear(x.float(), y.float())
 

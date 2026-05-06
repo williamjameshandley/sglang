@@ -39,9 +39,9 @@ def flash_mla_with_kvcache_entrypoint(
 
     if backend is SparseMLADecodeBackend.TILELANG:
         from sglang.srt.layers.attention.nsa.tilelang_kernel import (
-            dpsk_v4_bf16_sparse_attention_fwd,
+            dpsk_v4_fp8_attention_fwd,
         )
-        return dpsk_v4_bf16_sparse_attention_fwd(**kwargs)
+        return dpsk_v4_fp8_attention_fwd(**kwargs)
 
     if backend is SparseMLADecodeBackend.FLASH_MLA:
         import flash_mla

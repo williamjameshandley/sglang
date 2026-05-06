@@ -14,7 +14,10 @@ import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import fused_rope, linear_bf16_fp32
-from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.configs.deepseek_v4 import (
+    DeepSeekV4Config,
+    set_fp4_experts,
+)
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
@@ -33,7 +36,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
-from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+from sglang.srt.layers.deepseek_v4_rope import (
+    apply_rotary_emb_triton,
+    fused_norm_rope_inplace_triton,
+)
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     dp_gather_partial,
@@ -240,6 +246,8 @@ class Compressor(nn.Module):
 
     @cached_property
     def use_fused_compress(self) -> bool:
+        if _is_hip:
+            return False
         if (
             envs.SGLANG_OPT_USE_FUSED_PAGED_COMPRESS.get()
             and envs.SGLANG_OPT_DPSK_V4_RADIX.get()
@@ -249,6 +257,10 @@ class Compressor(nn.Module):
             envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
             and not envs.SGLANG_OPT_DPSK_V4_RADIX.get()
         )
+
+    @cached_property
+    def use_hip_fused_compress(self) -> bool:
+        return _is_hip and envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
 
     def apply_ape_hotfix(self):
         assert not self.ape_converted
@@ -441,7 +453,6 @@ class Compressor(nn.Module):
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
             assert kv_compressed.dtype == torch.float32
-            kv_compressed = self.norm(kv_compressed)
 
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
@@ -449,9 +460,15 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            apply_rotary_emb_triton(
-                kv_compressed[..., -self.rope_head_dim :], freqs_cis
-            )
+            if self.use_hip_fused_compress:
+                fused_norm_rope_inplace_triton(
+                    kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+                )
+            else:
+                kv_compressed = self.norm(kv_compressed)
+                apply_rotary_emb_triton(
+                    kv_compressed[..., -self.rope_head_dim :], freqs_cis
+                )
             del beg_idx, end_idx
 
             if self.rotate:
@@ -545,11 +562,20 @@ class Compressor(nn.Module):
             kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
-        kv_compressed = self.norm(kv_compressed)
-        self.print_tensor(kv_compressed, "kv_after_norm")
-        freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-        self.print_tensor(freqs_cis, "freqs_cis")
-        apply_rotary_emb_triton(kv_compressed[..., -self.rope_head_dim :], freqs_cis)
+        if self.use_hip_fused_compress:
+            # HIP-only: share the per-step freqs_cis gather across layers.
+            freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
+            fused_norm_rope_inplace_triton(
+                kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+            )
+        else:
+            kv_compressed = self.norm(kv_compressed)
+            self.print_tensor(kv_compressed, "kv_after_norm")
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            self.print_tensor(freqs_cis, "freqs_cis")
+            apply_rotary_emb_triton(
+                kv_compressed[..., -self.rope_head_dim :], freqs_cis
+            )
         self.print_tensor(kv_compressed, "kv_after_rope")
         if self.rotate:
             kv_compressed = rotate_activation(kv_compressed)
@@ -666,7 +692,6 @@ class Compressor(nn.Module):
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
             assert kv_compressed.dtype == torch.float32
-            kv_compressed = self.norm(kv_compressed)
 
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
@@ -674,9 +699,15 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            apply_rotary_emb_triton(
-                kv_compressed[..., -self.rope_head_dim :], freqs_cis
-            )
+            if self.use_hip_fused_compress:
+                fused_norm_rope_inplace_triton(
+                    kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+                )
+            else:
+                kv_compressed = self.norm(kv_compressed)
+                apply_rotary_emb_triton(
+                    kv_compressed[..., -self.rope_head_dim :], freqs_cis
+                )
             del beg_idx, end_idx
 
             if self.rotate:
@@ -758,11 +789,20 @@ class Compressor(nn.Module):
             kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
-        kv_compressed = self.norm(kv_compressed)
-        self.print_tensor(kv_compressed, "kv_after_norm")
-        freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-        self.print_tensor(freqs_cis, "freqs_cis")
-        apply_rotary_emb_triton(kv_compressed[..., -self.rope_head_dim :], freqs_cis)
+        if self.use_hip_fused_compress:
+            # HIP-only: share the per-step freqs_cis gather across layers.
+            freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
+            fused_norm_rope_inplace_triton(
+                kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+            )
+        else:
+            kv_compressed = self.norm(kv_compressed)
+            self.print_tensor(kv_compressed, "kv_after_norm")
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            self.print_tensor(freqs_cis, "freqs_cis")
+            apply_rotary_emb_triton(
+                kv_compressed[..., -self.rope_head_dim :], freqs_cis
+            )
         self.print_tensor(kv_compressed, "kv_after_rope")
         if self.rotate:
             kv_compressed = rotate_activation(kv_compressed)
@@ -955,7 +995,6 @@ class Compressor(nn.Module):
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
             assert kv_compressed.dtype == torch.float32
-            kv_compressed = self.norm(kv_compressed)
 
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
@@ -963,9 +1002,15 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            apply_rotary_emb_triton(
-                kv_compressed[..., -self.rope_head_dim :], freqs_cis
-            )
+            if self.use_hip_fused_compress:
+                fused_norm_rope_inplace_triton(
+                    kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+                )
+            else:
+                kv_compressed = self.norm(kv_compressed)
+                apply_rotary_emb_triton(
+                    kv_compressed[..., -self.rope_head_dim :], freqs_cis
+                )
             del beg_idx, end_idx
 
             if self.rotate:
@@ -987,6 +1032,19 @@ class Compressor(nn.Module):
 
         return compressed_kv_output
 
+    def _init_freqs_cis_per_decode_step(
+        self,
+        forward_batch: ForwardBatch,
+        seq_lens: torch.Tensor,
+    ) -> torch.Tensor:
+        attr = f"freqs_cis_c{self.ratio}"
+        cached = getattr(forward_batch, attr, None)
+        if cached is not None:
+            return cached
+        decoded = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+        setattr(forward_batch, attr, decoded)
+        return decoded
+
     def compress_decode_old(
         self,
         kv_and_scores: KVAndScore,
@@ -1000,66 +1058,103 @@ class Compressor(nn.Module):
         req_pool_indices = forward_batch.req_pool_indices
 
         bs = kv_and_scores.kv.size(0)
-        write_pos = (seq_lens - 1) % self.ratio + self.overlap * self.ratio
-        kv_and_score_states_pool[req_pool_indices, write_pos] = kv_and_scores
-
-        # NOTE: need to copy out before modifying overlap states
-        # kv_states: [bs, coff * ratio, coff * head_dim]
-        kv_and_score_to_compress = kv_and_score_states_pool[req_pool_indices]
-
-        if self.overlap:
-            # Shift just compressed kv states left by ratio
-            should_shift = seq_lens % self.ratio == 0
-            kv_and_score_states_pool[req_pool_indices, : self.ratio] = KVAndScore(
-                kv=torch.where(
-                    should_shift[:, None, None],
-                    kv_and_score_to_compress.kv[:, self.ratio :],
-                    kv_and_score_to_compress.kv[:, : self.ratio],
-                ),
-                score=torch.where(
-                    should_shift[:, None, None],
-                    kv_and_score_to_compress.score[:, self.ratio :],
-                    kv_and_score_to_compress.score[:, : self.ratio],
-                ),
+        if self.use_hip_fused_compress and self.ratio == 4 and self.overlap:
+            from sglang.srt.layers.attention.compressed.fused_compress_old_triton import (
+                fused_compress_c4_decode_old_triton,
             )
 
-        # shape: [bs * coff, ratio, coff * head_dim]
-        kv_and_score_to_compress = kv_and_score_to_compress.view(
-            -1, self.ratio, self.coff * self.head_dim
-        )
-        kv_and_score_to_compress.score = (
-            kv_and_score_to_compress.score + self.ape.unsqueeze(0)
-        )
+            kv_compressed = fused_compress_c4_decode_old_triton(
+                pool_kv=kv_and_score_states_pool.kv,
+                kv_score_input_kv=kv_and_scores.kv,
+                ape=self.ape,
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
+                head_dim=self.head_dim,
+            )
+        elif self.use_hip_fused_compress and self.ratio == 128 and not self.overlap:
+            from sglang.srt.layers.attention.compressed.fused_compress_old_triton import (
+                fused_compress_c128_decode_old_triton,
+            )
 
-        if self.overlap:
-            # shape: [bs, coff * ratio, coff * head_dim]
+            kv_compressed = fused_compress_c128_decode_old_triton(
+                pool_kv=kv_and_score_states_pool.kv,
+                kv_score_input_kv=kv_and_scores.kv,
+                ape=self.ape,
+                seq_lens=seq_lens,
+                req_pool_indices=req_pool_indices,
+                head_dim=self.head_dim,
+            )
+        else:
+            write_pos = (seq_lens - 1) % self.ratio + self.overlap * self.ratio
+            kv_and_score_states_pool[req_pool_indices, write_pos] = kv_and_scores
+
+            # NOTE: need to copy out before modifying overlap states
+            # kv_states: [bs, coff * ratio, coff * head_dim]
+            kv_and_score_to_compress = kv_and_score_states_pool[req_pool_indices]
+
+            if self.overlap:
+                # Shift just compressed kv states left by ratio
+                should_shift = seq_lens % self.ratio == 0
+                kv_and_score_states_pool[req_pool_indices, : self.ratio] = KVAndScore(
+                    kv=torch.where(
+                        should_shift[:, None, None],
+                        kv_and_score_to_compress.kv[:, self.ratio :],
+                        kv_and_score_to_compress.kv[:, : self.ratio],
+                    ),
+                    score=torch.where(
+                        should_shift[:, None, None],
+                        kv_and_score_to_compress.score[:, self.ratio :],
+                        kv_and_score_to_compress.score[:, : self.ratio],
+                    ),
+                )
+
+            # shape: [bs * coff, ratio, coff * head_dim]
             kv_and_score_to_compress = kv_and_score_to_compress.view(
-                bs, self.coff * self.ratio, self.coff * self.head_dim
+                -1, self.ratio, self.coff * self.head_dim
             )
-            kv_and_score_to_compress.kv = self.overlap_transform_decode(
+            kv_and_score_to_compress.score = (
+                kv_and_score_to_compress.score + self.ape.unsqueeze(0)
+            )
+
+            if self.overlap:
+                # shape: [bs, coff * ratio, coff * head_dim]
+                kv_and_score_to_compress = kv_and_score_to_compress.view(
+                    bs, self.coff * self.ratio, self.coff * self.head_dim
+                )
+                kv_and_score_to_compress.kv = self.overlap_transform_decode(
+                    kv_and_score_to_compress.kv
+                )
+                kv_and_score_to_compress.score = self.overlap_transform_decode(
+                    kv_and_score_to_compress.score
+                )
+
+            self.print_tensor(kv_and_score_to_compress.kv, "kv_to_compress")
+            self.print_tensor(kv_and_score_to_compress.score, "score_to_compress")
+
+            # kv_to_compress: [bs, ratio * coff, head_dim]
+            kv_and_score_to_compress = kv_and_score_to_compress.view(
+                bs, self.ratio * self.coff, self.head_dim
+            )
+
+            kv_compressed = (
                 kv_and_score_to_compress.kv
-            )
-            kv_and_score_to_compress.score = self.overlap_transform_decode(
-                kv_and_score_to_compress.score
-            )
-
-        self.print_tensor(kv_and_score_to_compress.kv, "kv_to_compress")
-        self.print_tensor(kv_and_score_to_compress.score, "score_to_compress")
-
-        # kv_to_compress: [bs, ratio * coff, head_dim]
-        kv_and_score_to_compress = kv_and_score_to_compress.view(
-            bs, self.ratio * self.coff, self.head_dim
-        )
-
-        kv_compressed = (
-            kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
-        ).sum(dim=1)
+                * kv_and_score_to_compress.score.softmax(dim=1)
+            ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
-        kv_compressed = self.norm(kv_compressed)
-        self.print_tensor(kv_compressed, "kv_after_norm")
-        freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-        self.print_tensor(freqs_cis, "freqs_cis")
-        apply_rotary_emb_triton(kv_compressed[..., -self.rope_head_dim :], freqs_cis)
+        if self.use_hip_fused_compress:
+            # HIP-only: share the per-step freqs_cis gather across layers.
+            freqs_cis = self._init_freqs_cis_per_decode_step(forward_batch, seq_lens)
+            fused_norm_rope_inplace_triton(
+                kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+            )
+        else:
+            kv_compressed = self.norm(kv_compressed)
+            self.print_tensor(kv_compressed, "kv_after_norm")
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            self.print_tensor(freqs_cis, "freqs_cis")
+            apply_rotary_emb_triton(
+                kv_compressed[..., -self.rope_head_dim :], freqs_cis
+            )
         self.print_tensor(kv_compressed, "kv_after_rope")
         if self.rotate:
             kv_compressed = rotate_activation(kv_compressed)
@@ -1853,6 +1948,23 @@ class DeepseekV4DecoderLayer(nn.Module):
             # returned post should be [n, hc_mult]
             return y, post.squeeze(-1), comb
 
+        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
+            from aiter.ops.mhc import mhc_pre
+
+            post, comb, y = mhc_pre(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=2.0,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+            )
+            # returned post should be [n, hc_mult]
+            return y, post.squeeze(-1), comb
+
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             # DeepGEMM implementation
             import deep_gemm
@@ -1910,6 +2022,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             from sglang.srt.layers.mhc import mhc_post
 
             result = mhc_post(x, residual, post, comb)
+            return result
+
+        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
+            from aiter.ops.mhc import mhc_post
+
+            result = torch.empty_like(residual)
+            mhc_post(result, x, residual, post, comb)
+
             return result
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
@@ -2149,6 +2269,11 @@ class DeepseekV4Model(nn.Module):
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
 
+        # Reset Compressor's per-step freqs_cis cache from any previous step.
+        for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
+            if hasattr(forward_batch, _attr):
+                delattr(forward_batch, _attr)
+
         for i in range(self.start_layer, self.end_layer):
             # TODO: ctx?
             layer = self.layers[i]
@@ -2196,6 +2321,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        set_fp4_experts(getattr(config, "expert_dtype", None) == "fp4")
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         # Detect MXFP4 routed experts (e.g. DeepSeek-V4-Flash). The HF config
@@ -2299,6 +2425,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             disable_reason = "2604 routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
         elif getattr(self, "routed_experts_mxfp4", False):
             disable_reason = "MXFP4 routed experts (expert_dtype=fp4) require shared experts to remain FP8; fusion would mix quantization formats."
+        elif getattr(self.config, "expert_dtype", None) == "fp4":
+            disable_reason = "Routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
 
         if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
             disable_reason = "2604B checkpoint requires different clamping for shared and routed experts"
@@ -2512,7 +2640,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             envs.SGLANG_DSV4_MODE.get() == "2604"
             and not envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
         ):
-            if envs.SGLANG_DSV4_FP4_EXPERTS.get():
+            if getattr(self.config, "expert_dtype", None) == "fp4":
                 weights = _dequant_fp8_wo_a(weights)
             else:
                 # Converted FP8 checkpoint: wo_a is already bf16; drop stale wo_a.scale if present
@@ -2861,9 +2989,9 @@ EntryClass = [DeepseekV4ForCausalLM]
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequant fp8 block-quantized wo_a weight: bf16 = fp8_weight * e8m0_scale.
 
-    Specifically for wo_a in 2604 checkpoint:
-      weight: [8192, 4096] fp8_e4m3fn   (64*128 x 32*128)
-      scale:  [64, 32]     fp8_e8m0fnu  (per 128x128 block)
+    The weight and scale use 128x128 block quantization:
+      weight: [N, K] fp8_e4m3fn   (N and K must be divisible by 128)
+      scale:  [N//128, K//128]    fp8_e8m0fnu  (per 128x128 block)
     """
     from einops import rearrange
 
@@ -2873,8 +3001,14 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     assert (
         scale.dtype == torch.float8_e8m0fnu
     ), f"expected fp8_e8m0fnu, got {scale.dtype}"
-    assert weight.shape == (8192, 4096), f"unexpected weight shape {weight.shape}"
-    assert scale.shape == (64, 32), f"unexpected scale shape {scale.shape}"
+    N, K = weight.shape
+    assert (
+        N % 128 == 0 and K % 128 == 0
+    ), f"weight dims must be divisible by 128, got {weight.shape}"
+    assert scale.shape == (
+        N // 128,
+        K // 128,
+    ), f"scale shape {scale.shape} doesn't match weight shape {weight.shape}"
 
     weight_f32 = rearrange(
         weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=128, bk=128
@@ -2883,7 +3017,6 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
     )
 
-    assert result.shape == (8192, 4096)
     return result.to(torch.bfloat16)
 
 
@@ -2892,24 +3025,28 @@ def _dequant_fp8_wo_a(
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     """Dequant fp8 wo_a weights inline: pair (wo_a.scale, wo_a.weight) -> bf16 wo_a.weight.
 
-    2601 checkpoint:
-      layers.0.attn.wo_a.weight  torch.bfloat16  [8192, 4096]  64.00MB  min=-0.375 max=0.3125
-
-    2604 checkpoint:
-      layers.0.attn.wo_a.scale  torch.float8_e8m0fnu  [64, 32]  0.00MB
-      layers.0.attn.wo_a.weight  torch.float8_e4m3fn  [8192, 4096]  32.00MB
+    Streaming version: buffers only wo_a.scale tensors (tiny) until the
+    corresponding wo_a.weight arrives.  All other weights pass through
+    immediately so we never materialise the full checkpoint in memory.
     """
-    weights_dict = dict(weights)
+    pending_scales: dict[str, torch.Tensor] = {}
 
-    for name in list(weights_dict.keys()):
-        if name not in weights_dict:
+    for name, tensor in weights:
+        if name.endswith(".wo_a.scale"):
+            pending_scales[name] = tensor
             continue
-        if not name.endswith(".wo_a.weight"):
-            continue
-        scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
-        assert scale_name in weights_dict
-        weight = weights_dict.pop(name)
-        scale = weights_dict.pop(scale_name)
-        yield name, _dequant_fp8(weight, scale)
 
-    yield from weights_dict.items()
+        if name.endswith(".wo_a.weight") and tensor.dtype == torch.float8_e4m3fn:
+            scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
+            assert scale_name in pending_scales, (
+                f"wo_a.scale must appear before wo_a.weight in checkpoint, "
+                f"missing {scale_name}"
+            )
+            scale = pending_scales.pop(scale_name)
+            yield name, _dequant_fp8(tensor, scale)
+            continue
+
+        yield name, tensor
+
+    for scale_name, scale_tensor in pending_scales.items():
+        yield scale_name, scale_tensor
