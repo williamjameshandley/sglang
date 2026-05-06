@@ -331,6 +331,7 @@ class Compressor(nn.Module):
             print(f"[sgl] {name}: shape={y.shape}, dtype={y.dtype}, device={y.device}")
             print(f"{y.flatten()[:10]}...{y.flatten()[-10:]}")
 
+    @torch.compiler.allow_in_graph
     def compress_extend_paged(
         self,
         kv_and_scores: KVAndScore,
@@ -473,6 +474,7 @@ class Compressor(nn.Module):
 
         return compressed_kv_output
 
+    @torch.compiler.allow_in_graph
     def compress_decode_paged(
         self,
         kv_and_scores: KVAndScore,
