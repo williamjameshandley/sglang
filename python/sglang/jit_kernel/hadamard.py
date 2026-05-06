@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.jit_kernel.utils import KERNEL_PATH, cache_once, load_jit, make_cpp_args
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -27,6 +28,11 @@ def _jit_hadamard_module(dtype: torch.dtype) -> Module:
         ],
         extra_include_paths=[str(hadamard_include_dir)],
     )
+
+
+def _kernel_fn(variant: str, dtype: torch.dtype) -> Callable:
+    module = _jit_hadamard_module(dtype)
+    return getattr(module, variant)
 
 
 def _hadamard_transform_impl(
@@ -56,26 +62,36 @@ def _hadamard_transform_impl(
     return out.reshape(shapes_og)
 
 
+@register_custom_op(op_name="hadamard_transform", mutates_args=[], out_shape=0)
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 8, module.hadamard_transform)
+    return _hadamard_transform_impl(
+        x, scale, 8, _kernel_fn("hadamard_transform", x.dtype)
+    )
 
 
+@register_custom_op(op_name="hadamard_transform_12n", mutates_args=[], out_shape=0)
 def hadamard_transform_12n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 4 * 12, module.hadamard_transform_12n)
+    return _hadamard_transform_impl(
+        x, scale, 4 * 12, _kernel_fn("hadamard_transform_12n", x.dtype)
+    )
 
 
+@register_custom_op(op_name="hadamard_transform_20n", mutates_args=[], out_shape=0)
 def hadamard_transform_20n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 4 * 20, module.hadamard_transform_20n)
+    return _hadamard_transform_impl(
+        x, scale, 4 * 20, _kernel_fn("hadamard_transform_20n", x.dtype)
+    )
 
 
+@register_custom_op(op_name="hadamard_transform_28n", mutates_args=[], out_shape=0)
 def hadamard_transform_28n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 4 * 28, module.hadamard_transform_28n)
+    return _hadamard_transform_impl(
+        x, scale, 4 * 28, _kernel_fn("hadamard_transform_28n", x.dtype)
+    )
 
 
+@register_custom_op(op_name="hadamard_transform_40n", mutates_args=[], out_shape=0)
 def hadamard_transform_40n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    module = _jit_hadamard_module(x.dtype)
-    return _hadamard_transform_impl(x, scale, 4 * 40, module.hadamard_transform_40n)
+    return _hadamard_transform_impl(
+        x, scale, 4 * 40, _kernel_fn("hadamard_transform_40n", x.dtype)
+    )
