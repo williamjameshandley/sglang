@@ -1283,10 +1283,13 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    get_global_experts_capturer().capture(
-        layer_id=layer_id,
-        topk_ids=topk_ids,
-    )
+    # Side-effect Python hook; fullgraph=True rejects it. Skip under
+    # Dynamo/PCG trace; eager-mode capture/debug still works.
+    if not torch._dynamo.is_compiling():
+        get_global_experts_capturer().capture(
+            layer_id=layer_id,
+            topk_ids=topk_ids,
+        )
     if _is_cuda:
         # When shared experts are fused (appended as extra columns in topk_ids),
         # EPLB dispatch must only remap the routed expert columns.
@@ -1465,7 +1468,12 @@ def select_experts(
         expert_location_dispatch_info=expert_location_dispatch_info,
     )
 
-    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
+    # Side-effect Python hook; fullgraph=True rejects it. Skip under
+    # Dynamo/PCG trace; eager-mode recording for debug/EPLB still works.
+    if not torch._dynamo.is_compiling():
+        get_global_expert_distribution_recorder().on_select_experts(
+            topk_ids=topk_ids
+        )
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
