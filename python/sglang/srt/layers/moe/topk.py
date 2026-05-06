@@ -531,6 +531,14 @@ class TopK(MultiPlatformOp):
                 "masking; -1 expert IDs would be rejected by "
                 "to_triton_kernels_format inside the per-layer custom op"
             )
+            # EPLB remap would put topk_ids in a different expert space than
+            # router_logits columns; the per-layer custom op's internal
+            # to_triton_kernels_format would build invalid routing metadata.
+            assert expert_location_dispatch_info is None, (
+                "TRITON_KERNEL TopK does not support EPLB; "
+                "router_logits columns and topk_ids must remain in the "
+                "same expert space"
+            )
 
             self.topk_config.torch_native = False
             with use_symmetric_memory(
