@@ -765,6 +765,95 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_weight = Parameter(w13_weight.data, requires_grad=False)
             layer.w2_weight = Parameter(w2_weight.data, requires_grad=False)
         torch.cuda.empty_cache()
+        self._maybe_register_deepseek_v4_moe_pcg_op(layer)
+
+    def _maybe_register_deepseek_v4_moe_pcg_op(self, layer):
+        """Register a per-layer custom op that hides the triton_kernels
+        MoE GEMM execution behind a Tensor-only `register_custom_op`
+        boundary, so PCG/Dynamo never sees `RoutingData`,
+        `PrecisionConfig`, wrapped MXFP4 tensors, or the external
+        `triton_kernels` library calls.
+
+        Idempotent. Returns early until BOTH `process_weights_after_loading`
+        (which sets `self.w13_weight_triton_tensor`) and `create_moe_runner`
+        (which sets `self.moe_runner_config`) have completed; whichever
+        runs second performs the registration.
+        """
+        if not self.use_triton_kernels:
+            return
+        if not hasattr(self, "moe_runner_config"):
+            return
+        if not hasattr(self, "w13_weight_triton_tensor"):
+            return
+        if getattr(layer, "deepseek_v4_moe_pcg_op", None) is not None:
+            return
+
+        import re as _re
+        from sglang.srt.utils.custom_op import (
+            register_custom_op as _register_custom_op,
+        )
+        from sglang.srt.layers.moe.topk import (
+            to_triton_kernels_format as _to_triton_kernels_format,
+        )
+        from sglang.srt.layers.moe.fused_moe_triton.triton_kernels_moe import (
+            triton_kernel_fused_experts as _triton_kernel_fused_experts,
+        )
+
+        cfg = self.moe_runner_config
+        assert not cfg.no_combine, (
+            "PCG path requires no_combine=False (fake_impl assumes "
+            "scatter-combined output shape)"
+        )
+
+        w13 = self.w13_weight_triton_tensor
+        w2 = self.w2_weight_triton_tensor
+        w13_pcg = self.w13_precision_config
+        w2_pcg = self.w2_precision_config
+        activation = cfg.activation
+        apply_rw_on_input = cfg.apply_router_weight_on_input
+        global_num_experts = self.num_experts
+
+        safe = _re.sub(r"[^0-9a-zA-Z_]", "_", self.prefix)
+        op_name = f"deepseek_v4_moe_{safe}_"
+
+        def _impl(
+            hidden_states: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+            router_logits: torch.Tensor,
+        ) -> torch.Tensor:
+            tk_topk = _to_triton_kernels_format(
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                router_logits=router_logits,
+                n_expts_tot=router_logits.shape[-1],
+                n_expts_act=topk_weights.shape[-1],
+            )
+            routing_data, gather_idx, scatter_idx = tk_topk
+            return _triton_kernel_fused_experts(
+                hidden_states=hidden_states,
+                w1=w13,
+                w2=w2,
+                routing_data=routing_data,
+                gather_indx=gather_idx,
+                scatter_indx=scatter_idx,
+                inplace=False,
+                activation=activation,
+                apply_router_weight_on_input=apply_rw_on_input,
+                global_num_experts=global_num_experts,
+                w1_pcg=w13_pcg,
+                w2_pcg=w2_pcg,
+            )
+
+        def _fake(hidden_states, topk_weights, topk_ids, router_logits):
+            return torch.empty_like(hidden_states)
+
+        layer.deepseek_v4_moe_pcg_op = _register_custom_op(
+            _impl,
+            op_name=op_name,
+            mutates_args=[],
+            fake_impl=_fake,
+        )
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -776,6 +865,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             else MoeRunnerBackend.TRITON
         )
         self.runner = MoeRunner(backend, moe_runner_config)
+        self._maybe_register_deepseek_v4_moe_pcg_op(layer)
 
     def apply(
         self,
