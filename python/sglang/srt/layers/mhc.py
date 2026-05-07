@@ -315,11 +315,6 @@ def mhc_pre_gemm_sqrsum_tilelang(
                     sqrsum_part[i, j] += x_frag[i, jj * 4 + j] * x_frag[i, jj * 4 + j]
 
             # should be TF32 gemm
-            #
-            # TileLang 0.1.9 dropped `wg_wait` from `T.gemm`. The original
-            # value here was `wg_wait=0`, which requested synchronous
-            # completion before dependent work; the current public API
-            # provides the same ordering.
             T.gemm(
                 x_frag,
                 fn_smem,
@@ -402,11 +397,6 @@ def mhc_pre_gemm_sqrsum_splitk_kernel(
                         sq_part4[i, j] += v * v
 
                 # partial GEMM accumulate
-                #
-                # See note above on the equivalent T.gemm call: TileLang
-                # 0.1.9 removed the public `wg_wait` kwarg; the previous
-                # value was `wg_wait=0`, so this call still uses
-                # synchronous dependency ordering.
                 T.gemm(
                     x_f,
                     fn_smem,
