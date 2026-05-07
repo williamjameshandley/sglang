@@ -1060,6 +1060,7 @@ def compile_aot():
         ("cublas", _jit_torch_cublas_bf16_fp32),
         ("common", _jit_common_module),
         ("topk", _jit_topk_module),
+        ("topk_v2", _jit_topk_v2_module),
         ("hash_topk", _jit_hash_topk_module),
         ("rope", _jit_fused_rope_module),
         ("metadata", _jit_metadata_module),
