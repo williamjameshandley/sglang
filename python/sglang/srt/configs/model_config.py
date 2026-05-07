@@ -569,20 +569,7 @@ class ModelConfig:
             if envs.SGLANG_DSV4_MODE.get() == "2604":
                 self.v_head_dim = self.head_dim
             self.index_head_dim = self.hf_config.index_head_dim
-            # transformers DeepseekV4Config refactor: legacy `compress_ratios`
-            # list is consumed at __init__ and converted into `layer_types`
-            # (and dropped from the object). Reverse-derive when needed.
-            if hasattr(self.hf_config, "compress_ratios"):
-                self.compress_ratios = self.hf_config.compress_ratios
-            else:
-                _LAYER_TYPE_TO_RATIO = {
-                    "sliding_attention": 0,
-                    "compressed_sparse_attention": 4,
-                    "heavily_compressed_attention": 128,
-                }
-                self.compress_ratios = [
-                    _LAYER_TYPE_TO_RATIO[t] for t in self.hf_config.layer_types
-                ]
+            self.compress_ratios = self.hf_config.compress_ratios
             self.attention_arch = AttentionArch.MHA
             self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
             if self.hf_config.rope_scaling:
