@@ -137,8 +137,12 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
 
     if is_sm120_supported():
         # SM120 desktop Blackwell does not support the persistent/TMA MXFP4 path.
-        # This MXFP4 path uses StridedLayout and the non-persistent kernel with
-        # block_k=128 so the selected tile stays within the per-block shared-memory budget.
+        # This MXFP4 path uses StridedLayout and the non-persistent kernel.
+        # block_m=32 and block_k=64 were selected by the Phase 11 sm_120 sweep
+        # for V4-Flash MoE shapes (E=256, K=4096, N∈{2048,1024}, M∈{1..8})
+        # and produced +22.6% live decode tok/s vs the heuristic default
+        # (15.41 → 18.89). num_stages=1 is required to stay within the
+        # 99 KB sm_120 shared-memory budget.
         from triton_kernels.tensor_details.layout import StridedLayout
 
         value_layout = StridedLayout
@@ -147,19 +151,10 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         scale_layout_opts = {}
         constraints = {
             "is_persistent": False,
-            "block_k": 128,
+            "block_m": 32,
+            "block_k": 64,
             "num_stages": 1,
         }
-        # Phase 11 sweep override: SGLANG_SM120_MOE_CONSTRAINTS=JSON
-        # merges into the constraint dict at swizzle time. Used to drive
-        # the autotune sweep from a single env-var file. Removed after
-        # Phase 11.5 lands the winning config as the static default.
-        import json as _json
-        import os as _os
-
-        _override = _os.environ.get("SGLANG_SM120_MOE_CONSTRAINTS")
-        if _override:
-            constraints.update(_json.loads(_override))
         opt_flags.update_opt_flags_constraints(constraints)
     else:
         value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
