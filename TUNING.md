@@ -19,6 +19,7 @@ and a pointer to the raw evidence so any of it can be reproduced.
 |---|---|---|---|
 | Phase 7.5 — `_w8a8_block_fp8_matmul` JSON configs | `0adf6fb` | (used by FP8 paths in shared experts / attention; per-shape baseline win, not separately measured at decode level) | 7 JSON tile configs in `python/sglang/srt/layers/moe/moe_runner/triton_utils/configs/triton_3_5_1/` |
 | Phase 11 — `matmul_ogs` MoE constraints (V4-Flash MXFP4 routed experts) | `0299f13` | **15.41 → 18.89 tok/s (+22.6%)** | `python/sglang/srt/layers/quantization/sm120_mxfp4_tuning/` |
+| Phase 12-A — sparse-MLA UE8M0 scale-load dedup via compact tile + `tl.gather` | `69e4eeb` | **18.89 → 19.33 tok/s (+2.3%)**; harness shows 8-17% per-call kernel speedup | sparse-MLA single-split + partial kernels in `python/sglang/jit_kernel/deepseek_v4.py` |
 | Phase 14 (out of scope here, listed for context) — full upstream merge | `43d710b`, `1bb48eb`, `8ee8a8f`, `82c45e8`, `60090c2` | Parity build, no perf claim | — |
 
 Other phases (Phase 4–10) closed correctness gaps, not perf tuning.
@@ -103,6 +104,57 @@ checkpoint format change):
 
 The sweep driver writes/restores `/etc/sglang/deepseek_v4_flash.env`
 to avoid clobbering site-specific settings.
+
+## Phase 12-B — `tl.dot_scaled` for sparse-MLA NoPE matmul: NOT YET ATTEMPTED PROPERLY
+
+Initial probe failed compile in `TritonGPUAccelerateMatmul` for
+both forms I tried — but those probes were malformed. Counter-
+evidence: the vendored `triton_kernels` library at
+`triton_kernels/matmul_ogs_details/_matmul_ogs.py:370` calls
+`tl.dot_scaled(x, x_scales, x_format, w, w_scales, w_format, ...)`
+and that path runs successfully on our sm_120 deployment as part of
+the Phase 11 MoE matmul. So `tl.dot_scaled` IS usable on sm_120;
+the question is whether a **correctly-shaped, both-sides-scaled**
+invocation can be made to fit the sparse-MLA NoPE matmul (BF16 Q
+× FP8 K with UE8M0 group-32 scales).
+
+A genuine 12-B attempt would either fake an all-ones e8m0 scale on
+the BF16 Q side, or split the matmul so the FP8 side goes through
+`tl.dot_scaled` directly. Tracked as deferred follow-up; not blocked
+infrastructurally.
+
+## Phase 12-C — sparse-MLA tile-constant sweep: NO WINNER
+
+Swept `BLOCK_M ∈ {16, 32}` × `KV_CHUNK ∈ {16, 32, 64}` (6 candidates)
+via the `_test_sparse_mla.py --time` harness (50 iters/case, 5
+warmup, fresh JIT compile per candidate via env-var override).
+
+Sum-of-medians across the 22 harness cases (lower = better):
+
+| Candidate | Sum-of-medians (µs) | Δ vs baseline |
+|---|---|---|
+| BM=16 KC=32 (production baseline) | 1296 | — |
+| BM=16 KC=16 | 1361 | +5.0% |
+| BM=16 KC=64 | 1439 | +11.0% |
+| BM=32 KC=16 | 1383 | +6.7% |
+| BM=32 KC=32 | 1389 | +7.2% |
+| BM=32 KC=64 | 1444 | +11.4% |
+
+Every candidate regressed cumulatively. `BM=32 KC=32` won the
+canonical decode case (B=1 h=64 topk=64, −9.2%) but regressed
+4-20% on every other case, including production-relevant
+B=2/4 decode cases. No live deployment test was run; harness
+signal was uniformly bad enough that running a wall-clock test
+on a candidate the harness already says regresses 4-20% across
+20/22 cases would be wasteful.
+
+**Conclusion**: `BLOCK_M=16, KV_CHUNK=32` is already at a local
+optimum for V4-Flash sparse-MLA shapes on sm_120. Phase 8.1's
+lesson cuts both ways — this time the harness signal was strong
+enough that further tile-knob exploration is contraindicated.
+
+Raw sweep CSV preserved at `/home/will/phase12c_sweep.csv` (not
+in-tree; one-off harness artifact).
 
 ## Other tuning axes still on the table
 
