@@ -150,6 +150,16 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
             "block_k": 128,
             "num_stages": 1,
         }
+        # Phase 11 sweep override: SGLANG_SM120_MOE_CONSTRAINTS=JSON
+        # merges into the constraint dict at swizzle time. Used to drive
+        # the autotune sweep from a single env-var file. Removed after
+        # Phase 11.5 lands the winning config as the static default.
+        import json as _json
+        import os as _os
+
+        _override = _os.environ.get("SGLANG_SM120_MOE_CONSTRAINTS")
+        if _override:
+            constraints.update(_json.loads(_override))
         opt_flags.update_opt_flags_constraints(constraints)
     else:
         value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
