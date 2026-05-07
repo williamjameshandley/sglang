@@ -1537,6 +1537,24 @@ def _sparse_mla_decode_kernel(
         token_byte_base = page_id64 * page_byte_stride + row64 * 576
         scale_byte_base = page_id64 * page_byte_stride + P * 576 + row64 * 8
 
+        # ===== Phase 12-A: load compact scale tile [KV_CHUNK, NOPE_GROUPS=7]
+        # ONCE per chunk. The pre-Phase-12 kernel issued two separate
+        # gather-with-broadcast loads (one [KV_CHUNK, 512] for QK NoPE, one
+        # [KV_CHUNK, BLOCK_DV] for P@V NoPE). Both targeted the same 7
+        # UE8M0 bytes per token via redundant addresses. The compact load
+        # plus two tl.gather ops emits ~50× fewer load instructions and
+        # ~7× fewer exp2 ops per inner loop.
+        # NOPE_GROUPS=7 is not a power of 2; tl.arange requires pow2. The
+        # V4-Flash KV layout has 7 active + 1 pad scale bytes per token, so
+        # loading 8 is safe; gather indices ∈ [0, 7) never touch the pad.
+        group_idx = tl.arange(0, 8)
+        scale_compact_offs = scale_byte_base[:, None] + group_idx[None, :]
+        scale_compact_bytes = tl.load(
+            KV_U8_ptr + scale_compact_offs,
+            mask=valid[:, None], other=0,
+        ).to(tl.float32)
+        nope_scale_compact = tl.exp2(scale_compact_bytes - 127.0)  # [KV_CHUNK, 8]
+
         # ===== Build full K [KV_CHUNK, 512] for QK^T =====
         # NoPE FP8 (masked outside NoPE; those positions become 0 then are
         # overwritten by the RoPE branch via additive merge).
@@ -1547,15 +1565,14 @@ def _sparse_mla_decode_kernel(
             mask=nope_load_mask, other=0.0,
         ).to(tl.float32)
 
-        # Direct per-element scale gather: scale_byte[k, d] is at
-        #   uint8 offset = scale_byte_base[k] + nope_group_d[d]
-        # No tl.dot needed — this is a true gather, not a matmul.
-        scale_byte_offs = scale_byte_base[:, None] + nope_group_d[None, :]
-        scale_bytes = tl.load(
-            KV_U8_ptr + scale_byte_offs,
-            mask=nope_load_mask, other=0,
-        ).to(tl.float32)
-        nope_scale = tl.exp2(scale_bytes - 127.0)  # [KV_CHUNK, 512]
+        # Per-element scale: gather from the compact tile by group index.
+        # nope_group_d[d] ∈ [0, NOPE_GROUPS) for NoPE positions; 0 for RoPE
+        # positions (which are masked out of nope_fp32 anyway, so the dummy
+        # scale value at index 0 is multiplied by 0).
+        qk_scale_index = tl.broadcast_to(
+            nope_group_d[None, :], (KV_CHUNK, HEAD_DIM_QK)
+        )
+        nope_scale = tl.gather(nope_scale_compact, qk_scale_index, axis=1)
         nope_deq = nope_fp32 * nope_scale          # 0 outside NoPE (mask)
 
         # RoPE BF16. bf16 element offset = (byte offset) >> 1.
@@ -1591,12 +1608,13 @@ def _sparse_mla_decode_kernel(
             KV_FP8_ptr + nope_dv_byte_offs,
             mask=nope_dv_load_mask, other=0.0,
         ).to(tl.float32)
-        scale_dv_byte_offs = scale_byte_base[:, None] + nope_group_dv[None, :]
-        scale_dv_bytes = tl.load(
-            KV_U8_ptr + scale_dv_byte_offs,
-            mask=nope_dv_load_mask, other=0,
-        ).to(tl.float32)
-        nope_dv_deq = nope_dv_fp32 * tl.exp2(scale_dv_bytes - 127.0)
+        # Phase 12-A: gather P@V scale from the same compact tile.
+        pv_scale_index = tl.broadcast_to(
+            nope_group_dv[None, :], (KV_CHUNK, BLOCK_DV)
+        )
+        nope_dv_deq = nope_dv_fp32 * tl.gather(
+            nope_scale_compact, pv_scale_index, axis=1
+        )
 
         rope_dv_elem_offs = rope_elem_base[:, None] + rope_dv_safe[None, :]
         rope_dv_load_mask = valid[:, None] & (~is_nope_dv)[None, :]
@@ -1641,6 +1659,16 @@ def _sparse_mla_decode_kernel(
                 page_id64 * extra_page_byte_stride + P_EXTRA * 576 + row64 * 8
             )
 
+            # Phase 12-A: compact scale tile for the compressed cache (load
+            # 8 = pow2; 8th byte is the layout pad slot, never used).
+            group_idx = tl.arange(0, 8)
+            scale_compact_offs = scale_byte_base[:, None] + group_idx[None, :]
+            scale_compact_bytes = tl.load(
+                EXTRA_KV_U8_ptr + scale_compact_offs,
+                mask=valid[:, None], other=0,
+            ).to(tl.float32)
+            nope_scale_compact = tl.exp2(scale_compact_bytes - 127.0)
+
             # === Build full K [KV_CHUNK, 512] for QK^T from compressed cache ===
             nope_byte_offs = token_byte_base[:, None] + nope_d_safe[None, :]
             nope_load_mask = valid[:, None] & is_nope_d[None, :]
@@ -1649,12 +1677,10 @@ def _sparse_mla_decode_kernel(
                 mask=nope_load_mask, other=0.0,
             ).to(tl.float32)
 
-            scale_byte_offs = scale_byte_base[:, None] + nope_group_d[None, :]
-            scale_bytes = tl.load(
-                EXTRA_KV_U8_ptr + scale_byte_offs,
-                mask=nope_load_mask, other=0,
-            ).to(tl.float32)
-            nope_scale = tl.exp2(scale_bytes - 127.0)
+            qk_scale_index = tl.broadcast_to(
+                nope_group_d[None, :], (KV_CHUNK, HEAD_DIM_QK)
+            )
+            nope_scale = tl.gather(nope_scale_compact, qk_scale_index, axis=1)
             nope_deq = nope_fp32 * nope_scale
 
             rope_elem_base = (token_byte_base + HEAD_DIM_NOPE) >> 1
@@ -1686,12 +1712,12 @@ def _sparse_mla_decode_kernel(
                 EXTRA_KV_FP8_ptr + nope_dv_byte_offs,
                 mask=nope_dv_load_mask, other=0.0,
             ).to(tl.float32)
-            scale_dv_byte_offs = scale_byte_base[:, None] + nope_group_dv[None, :]
-            scale_dv_bytes = tl.load(
-                EXTRA_KV_U8_ptr + scale_dv_byte_offs,
-                mask=nope_dv_load_mask, other=0,
-            ).to(tl.float32)
-            nope_dv_deq = nope_dv_fp32 * tl.exp2(scale_dv_bytes - 127.0)
+            pv_scale_index = tl.broadcast_to(
+                nope_group_dv[None, :], (KV_CHUNK, BLOCK_DV)
+            )
+            nope_dv_deq = nope_dv_fp32 * tl.gather(
+                nope_scale_compact, pv_scale_index, axis=1
+            )
 
             rope_dv_elem_offs = rope_elem_base[:, None] + rope_dv_safe[None, :]
             rope_dv_load_mask = valid[:, None] & (~is_nope_dv)[None, :]
@@ -1849,16 +1875,24 @@ def _sparse_mla_decode_partial_kernel(
         token_byte_base = page_id64 * page_byte_stride + row64 * 576
         scale_byte_base = page_id64 * page_byte_stride + P * 576 + row64 * 8
 
+        # Phase 12-A: compact scale tile, gather to per-element scales.
+        group_idx = tl.arange(0, 8)
+        scale_compact_offs = scale_byte_base[:, None] + group_idx[None, :]
+        scale_compact_bytes = tl.load(
+            KV_U8_ptr + scale_compact_offs,
+            mask=valid[:, None], other=0,
+        ).to(tl.float32)
+        nope_scale_compact = tl.exp2(scale_compact_bytes - 127.0)
+
         nope_byte_offs = token_byte_base[:, None] + nope_d_safe[None, :]
         nope_load_mask = valid[:, None] & is_nope_d[None, :]
         nope_fp32 = tl.load(
             KV_FP8_ptr + nope_byte_offs, mask=nope_load_mask, other=0.0,
         ).to(tl.float32)
-        scale_byte_offs = scale_byte_base[:, None] + nope_group_d[None, :]
-        scale_bytes = tl.load(
-            KV_U8_ptr + scale_byte_offs, mask=nope_load_mask, other=0,
-        ).to(tl.float32)
-        nope_scale = tl.exp2(scale_bytes - 127.0)
+        qk_scale_index = tl.broadcast_to(
+            nope_group_d[None, :], (KV_CHUNK, HEAD_DIM_QK)
+        )
+        nope_scale = tl.gather(nope_scale_compact, qk_scale_index, axis=1)
         nope_deq = nope_fp32 * nope_scale
 
         rope_elem_base = (token_byte_base + HEAD_DIM_NOPE) >> 1
@@ -1886,12 +1920,12 @@ def _sparse_mla_decode_partial_kernel(
             KV_FP8_ptr + nope_dv_byte_offs,
             mask=nope_dv_load_mask, other=0.0,
         ).to(tl.float32)
-        scale_dv_byte_offs = scale_byte_base[:, None] + nope_group_dv[None, :]
-        scale_dv_bytes = tl.load(
-            KV_U8_ptr + scale_dv_byte_offs,
-            mask=nope_dv_load_mask, other=0,
-        ).to(tl.float32)
-        nope_dv_deq = nope_dv_fp32 * tl.exp2(scale_dv_bytes - 127.0)
+        pv_scale_index = tl.broadcast_to(
+            nope_group_dv[None, :], (KV_CHUNK, BLOCK_DV)
+        )
+        nope_dv_deq = nope_dv_fp32 * tl.gather(
+            nope_scale_compact, pv_scale_index, axis=1
+        )
 
         rope_dv_elem_offs = rope_elem_base[:, None] + rope_dv_safe[None, :]
         rope_dv_load_mask = valid[:, None] & (~is_nope_dv)[None, :]
@@ -1936,18 +1970,25 @@ def _sparse_mla_decode_partial_kernel(
                 page_id64 * extra_page_byte_stride + P_EXTRA * 576 + row64 * 8
             )
 
+            # Phase 12-A: compact scale tile for compressed cache.
+            group_idx = tl.arange(0, 8)
+            scale_compact_offs = scale_byte_base[:, None] + group_idx[None, :]
+            scale_compact_bytes = tl.load(
+                EXTRA_KV_U8_ptr + scale_compact_offs,
+                mask=valid[:, None], other=0,
+            ).to(tl.float32)
+            nope_scale_compact = tl.exp2(scale_compact_bytes - 127.0)
+
             nope_byte_offs = token_byte_base[:, None] + nope_d_safe[None, :]
             nope_load_mask = valid[:, None] & is_nope_d[None, :]
             nope_fp32 = tl.load(
                 EXTRA_KV_FP8_ptr + nope_byte_offs,
                 mask=nope_load_mask, other=0.0,
             ).to(tl.float32)
-            scale_byte_offs = scale_byte_base[:, None] + nope_group_d[None, :]
-            scale_bytes = tl.load(
-                EXTRA_KV_U8_ptr + scale_byte_offs,
-                mask=nope_load_mask, other=0,
-            ).to(tl.float32)
-            nope_scale = tl.exp2(scale_bytes - 127.0)
+            qk_scale_index = tl.broadcast_to(
+                nope_group_d[None, :], (KV_CHUNK, HEAD_DIM_QK)
+            )
+            nope_scale = tl.gather(nope_scale_compact, qk_scale_index, axis=1)
             nope_deq = nope_fp32 * nope_scale
 
             rope_elem_base = (token_byte_base + HEAD_DIM_NOPE) >> 1
@@ -1976,12 +2017,12 @@ def _sparse_mla_decode_partial_kernel(
                 EXTRA_KV_FP8_ptr + nope_dv_byte_offs,
                 mask=nope_dv_load_mask, other=0.0,
             ).to(tl.float32)
-            scale_dv_byte_offs = scale_byte_base[:, None] + nope_group_dv[None, :]
-            scale_dv_bytes = tl.load(
-                EXTRA_KV_U8_ptr + scale_dv_byte_offs,
-                mask=nope_dv_load_mask, other=0,
-            ).to(tl.float32)
-            nope_dv_deq = nope_dv_fp32 * tl.exp2(scale_dv_bytes - 127.0)
+            pv_scale_index = tl.broadcast_to(
+                nope_group_dv[None, :], (KV_CHUNK, BLOCK_DV)
+            )
+            nope_dv_deq = nope_dv_fp32 * tl.gather(
+                nope_scale_compact, pv_scale_index, axis=1
+            )
 
             rope_dv_elem_offs = rope_elem_base[:, None] + rope_dv_safe[None, :]
             rope_dv_load_mask = valid[:, None] & (~is_nope_dv)[None, :]
