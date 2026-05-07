@@ -30,11 +30,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
 
 
-# Phase 11.0 — one-shot trace of V4-Flash MoE shapes per distinct
-# (M, K, w1.shape, w2.shape, dtypes, n_expts_act). Revert before commit.
-_PHASE_11_0_SEEN: set = set()
-
-
 def quantize(w, dtype, dev, **opt):
     if dtype == "bf16":
         return w.to(torch.bfloat16), InFlexData()
@@ -143,24 +138,6 @@ def triton_kernel_fused_experts(
     E, _, N = w1.shape
     n_expts_act = routing_data.n_expts_act
     dtype = hidden_states.dtype
-
-    # Phase 11.0 trace: log once per distinct shape tuple.
-    _key = (
-        M, K, tuple(w1.shape), tuple(w2.shape),
-        str(hidden_states.dtype), str(w1.dtype), str(w2.dtype),
-        n_expts_act,
-        bool(w1_pcg is not None), bool(w2_pcg is not None),
-    )
-    if _key not in _PHASE_11_0_SEEN:
-        _PHASE_11_0_SEEN.add(_key)
-        print(
-            f"[phase11.0] M={M} K={K} w1.shape={tuple(w1.shape)} "
-            f"w2.shape={tuple(w2.shape)} hs.dtype={hidden_states.dtype} "
-            f"w1.dtype={w1.dtype} w2.dtype={w2.dtype} "
-            f"n_expts_act={n_expts_act} pcg=({w1_pcg is not None},"
-            f"{w2_pcg is not None})",
-            flush=True,
-        )
 
     if global_num_experts == -1:
         global_num_experts = E
