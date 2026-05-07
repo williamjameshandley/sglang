@@ -20,6 +20,8 @@ Exits non-zero on the first failure.
 """
 from __future__ import annotations
 
+import argparse
+import statistics
 import sys
 from typing import Optional
 
@@ -278,6 +280,104 @@ def _call_oracle_b(kwargs: dict) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
         return None
 
 
+def _time_case(
+    name: str,
+    *,
+    B: int,
+    h_q: int,
+    P: int,
+    num_pages: int,
+    topk: int,
+    topk_lengths: list[int],
+    sprinkle_neg1: bool,
+    sink_zeros: bool,
+    device: torch.device,
+    seed: int,
+    P_extra: int = 0,
+    extra_num_pages: int = 0,
+    extra_topk: int = 0,
+    extra_topk_lengths: Optional[list[int]] = None,
+    extra_sprinkle_neg1: bool = False,
+    num_splits: Optional[int] = None,
+    iters: int = 100,
+    warmup: int = 10,
+) -> None:
+    """Time-only case: Phase 12 wall-clock gate. No oracle comparison.
+
+    Reports per-call mean / median / min µs over `iters` post-warmup runs.
+    Differences between sweeps under the same case are the wall-clock gate
+    signal for kernel-restructuring changes (12-A scale-dedup, 12-B
+    tl.dot_scaled, 12-C tile-knob exploration).
+    """
+    has_extra = P_extra > 0
+    g = torch.Generator(device=device).manual_seed(seed + 7)
+    k_cache = _build_quantized_cache(num_pages, P, device, seed=seed)
+    q = torch.empty((B, 1, h_q, 512), dtype=torch.bfloat16, device=device)
+    q.uniform_(-1.0, 1.0, generator=g)
+    indices = _gen_indices(
+        B, topk, num_pages, P, topk_lengths, sprinkle_neg1, device, seed=seed,
+    )
+    topk_length = torch.tensor(topk_lengths, dtype=torch.int32, device=device)
+
+    extra_k_cache = extra_indices = extra_topk_length = None
+    if has_extra:
+        extra_k_cache = _build_quantized_cache(
+            extra_num_pages, P_extra, device, seed=seed + 100,
+        )
+        extra_indices = _gen_indices(
+            B, extra_topk, extra_num_pages, P_extra,
+            extra_topk_lengths, extra_sprinkle_neg1, device, seed=seed + 200,
+        )
+        extra_topk_length = torch.tensor(
+            extra_topk_lengths, dtype=torch.int32, device=device,
+        )
+
+    if sink_zeros:
+        attn_sink = torch.zeros(h_q, dtype=torch.float32, device=device)
+    else:
+        attn_sink = torch.empty(h_q, dtype=torch.float32, device=device)
+        attn_sink.uniform_(-2.0, 2.0, generator=g)
+
+    kwargs = dict(
+        q=q,
+        k_cache=k_cache,
+        indices=indices,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        softmax_scale=512 ** -0.5,
+        head_dim_v=512,
+        is_fp8_kvcache=True,
+        causal=False,
+        extra_k_cache=extra_k_cache,
+        extra_indices_in_kvcache=extra_indices,
+        extra_topk_length=extra_topk_length,
+    )
+    if num_splits is not None:
+        kwargs["num_splits"] = num_splits
+
+    # Warmup (JIT compile + first-call caching).
+    for _ in range(warmup):
+        flash_mla_with_kvcache_triton_sm120(**kwargs)
+    torch.cuda.synchronize(device)
+
+    # Timed runs.
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for i in range(iters):
+        starts[i].record()
+        flash_mla_with_kvcache_triton_sm120(**kwargs)
+        ends[i].record()
+    torch.cuda.synchronize(device)
+    times_us = [s.elapsed_time(e) * 1000.0 for s, e in zip(starts, ends)]
+    mean_us = statistics.mean(times_us)
+    median_us = statistics.median(times_us)
+    min_us = min(times_us)
+    print(
+        f"[TIME] {name}: mean={mean_us:7.2f}us median={median_us:7.2f}us "
+        f"min={min_us:7.2f}us  (n={iters})"
+    )
+
+
 def main() -> int:
     if not torch.cuda.is_available():
         print("CUDA unavailable; skipping.")
@@ -428,6 +528,31 @@ def main() -> int:
             num_splits=8,
         ),
     ]
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--time",
+        action="store_true",
+        help="Phase 12 wall-clock mode: time each case instead of "
+             "comparing to oracles. Reports per-call mean/median/min µs.",
+    )
+    parser.add_argument(
+        "--iters", type=int, default=100,
+        help="Timed iterations per case in --time mode (default 100).",
+    )
+    parser.add_argument(
+        "--warmup", type=int, default=10,
+        help="Discarded warmup iterations per case in --time mode "
+             "(default 10).",
+    )
+    args = parser.parse_args()
+
+    if args.time:
+        for case in cases:
+            _time_case(
+                device=device, iters=args.iters, warmup=args.warmup, **case,
+            )
+        return 0
 
     failures = 0
     for case in cases:
