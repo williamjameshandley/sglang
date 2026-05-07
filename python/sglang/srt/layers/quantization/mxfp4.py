@@ -141,8 +141,17 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
         # block_m=32 and block_k=64 were selected by the Phase 11 sm_120 sweep
         # for V4-Flash MoE shapes (E=256, K=4096, N∈{2048,1024}, M∈{1..8})
         # and produced +22.6% live decode tok/s vs the heuristic default
-        # (15.41 → 18.89). num_stages=1 is required to stay within the
-        # 99 KB sm_120 shared-memory budget.
+        # (15.41 → 18.89). num_stages=1 was tied with num_stages=2 in the
+        # sweep; we pick num_stages=1 as the lower-smem / lower-risk choice
+        # against the 99 KB sm_120 shared-memory budget.
+        #
+        # Caveat: update_opt_flags_constraints sets a PROCESS-GLOBAL dict
+        # in the OAI triton_kernels library, so these constraints apply
+        # to any sm_120 MXFP4 swizzle in the process, not only V4-Flash.
+        # Validated only on V4-Flash routed-expert shapes; re-run the
+        # Phase 11 sweep (see python/sglang/srt/layers/quantization/
+        # sm120_mxfp4_tuning/) before relying on this for a different
+        # sm_120 MXFP4 MoE model.
         from triton_kernels.tensor_details.layout import StridedLayout
 
         value_layout = StridedLayout

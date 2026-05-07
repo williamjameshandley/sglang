@@ -26,6 +26,13 @@ See `nested-growing-hammock.md` and the project README for that context.
 
 ## Phase 11 — sm_120 MoE matmul_ogs constraint tuning
 
+**Scope caveat:** `update_opt_flags_constraints` is a process-global
+dict in the OAI `triton_kernels` library. The constraints landed for
+V4-Flash apply to any sm_120 MXFP4 swizzle in the process, not only
+V4-Flash. Values validated only on V4-Flash routed-expert shapes
+(E=256, K=4096, N∈{2048, 1024}, M∈{1..8}). Re-run the sweep before
+using this fork to serve a different sm_120 MXFP4 MoE model.
+
 **Landing commit:** `0299f13`  
 **Sweep harness commit (later removed):** `0588e90`  
 **Trace-probe commits:** `0a991cd` (added) → `ab64457` (reverted)  
