@@ -600,7 +600,11 @@ def post_reorder_triton_kernel(
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=InDtype)
         for idx in range(topk):
             expert_id = tl.load(topk_ids_ptr + idx)
-            if expert_id > 0:
+            # `>= 0` (not `> 0`) — expert 0 is a valid expert in standard
+            # routing; the previous `> 0` silently dropped its contribution
+            # to any token whose top-k included expert 0. Matches the
+            # `>= 0` predicate already used by `fill_gateup_input_triton_kernel`.
+            if expert_id >= 0:
                 dst_idx_int32 = tl.load(src2dst_ptr + idx)
                 dst_idx = dst_idx_int32.to(tl.int64)
                 weigh_scale = tl.load(topk_weights_ptr + idx).to(InDtype)
@@ -1073,7 +1077,15 @@ def moe_ep_deepgemm_preprocess(
 
     # For masked grouped GEMM, shape M should be multiple of the block M (current block M: {block_m}) https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/jit_kernels/m_grouped_gemm.py#L165
     m_max = (hidden_states.size(0) // 256 + 1) * 256
-    expected_m = (topk_ids.numel() - 1) // num_local_experts + 1
+    # `expected_m` must be ≥ the max actual per-expert row count `masked_m.max()`.
+    # The previous formula `ceil(topk_ids.numel() / num_local_experts)` is an
+    # AVERAGE that under-estimates by E_local/active_E for sparse routing
+    # (e.g. decode bs=8 top_k=6 E=256 → expected_m=1 while masked_m=8).
+    # Underestimating produces directionally-correct output with wrong
+    # magnitude (~1.93× scaling on V4-Flash MXFP4 deepgemm path).
+    # Per-token top-k is unique per token, so per-expert row count cannot
+    # exceed hidden_states.size(0).
+    expected_m = hidden_states.size(0)
     gateup_input = torch.empty(
         (num_local_experts, m_max, hidden_states.size(1)),
         device=hidden_states.device,
