@@ -109,6 +109,11 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    # When True, w13_weight/w2_weight are PackedFP4 (int8-viewed nibbles)
+    # and the runner dispatches to deep_gemm.m_grouped_fp8_fp4_gemm_nt_*
+    # instead of grouped_gemm_nt_f8f8bf16_*. Used by V4-Flash MXFP4 routed
+    # experts. Activation side stays FP8 e4m3 + UE8M0 group-128 scales.
+    use_fp4: bool = False
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -177,12 +182,23 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             hidden_states_scale = tma_align_input_scale(hidden_states_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (hidden_states, hidden_states_scale),
-            w13_weight_fp8,
-            gateup_output,
-            m_indices,
-        )
+        if quant_info.use_fp4:
+            import deep_gemm
+            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+                a=(hidden_states, hidden_states_scale),
+                b=w13_weight_fp8,
+                d=gateup_output,
+                grouped_layout=m_indices,
+                recipe_a=(1, 128),
+                recipe_b=(1, 32),
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (hidden_states, hidden_states_scale),
+                w13_weight_fp8,
+                gateup_output,
+                m_indices,
+            )
 
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -215,12 +231,23 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = tma_align_input_scale(down_input_scale)
 
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
-            (down_input_fp8, down_input_scale),
-            w2_weight_fp8,
-            down_output,
-            m_indices,
-        )
+        if quant_info.use_fp4:
+            import deep_gemm
+            deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
+                a=(down_input_fp8, down_input_scale),
+                b=w2_weight_fp8,
+                d=down_output,
+                grouped_layout=m_indices,
+                recipe_a=(1, 128),
+                recipe_b=(1, 32),
+            )
+        else:
+            deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
+                (down_input_fp8, down_input_scale),
+                w2_weight_fp8,
+                down_output,
+                m_indices,
+            )
 
         return down_output
 
