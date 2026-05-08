@@ -1852,26 +1852,45 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Resolve MHC backend at layer-init time so the captured forward
         # contains no env reads or inline imports (Dynamo-traced PCG must
         # not see TileLang's `inspect.getsourcelines()` introspection).
-        # Tri-state: True/False explicit, None → auto (Triton on sm_120).
+        #
+        # MHC pre-GEMM resolution priority on sm_120:
+        #   1. SGLANG_OPT_USE_TRITON_MHC=True  → Triton MHC pre-GEMM.
+        #   2. SGLANG_OPT_USE_TRITON_MHC=False → legacy inline dispatch
+        #      (TileLang / AITER / DeepGEMM / torch).
+        #   3. Default (None) on sm_120 → DeepGEMM `tf32_hc_prenorm_gemm`
+        #      via `mhc_pre_deepgemm` (PR #324 sm_120 native dispatch);
+        #      `mhc_pre_big_fuse_triton` still runs the sinkhorn + per-head
+        #      normalization + output combination step (deepgemm has no
+        #      big_fuse equivalent).
+        #
+        # MHC post resolution: deepgemm has no equivalent, so the Triton
+        # post wrapper stays the sm_120 default unless explicitly disabled.
         triton_choice = envs.SGLANG_OPT_USE_TRITON_MHC.get()
-        if triton_choice is None:
-            try:
-                _major, _ = torch.cuda.get_device_capability()
-                _use_triton_mhc = (_major == 12)  # sm_120 desktop Blackwell
-            except Exception:
-                _use_triton_mhc = False
-        else:
-            _use_triton_mhc = bool(triton_choice)
+        try:
+            _major, _ = torch.cuda.get_device_capability()
+            _is_sm120 = (_major == 12)  # desktop Blackwell
+        except Exception:
+            _is_sm120 = False
 
-        if _use_triton_mhc:
+        if triton_choice is True:
             from sglang.jit_kernel.mhc_triton import (
                 mhc_post_triton_full,
                 mhc_pre_triton,
             )
             self._mhc_pre_fn = mhc_pre_triton
             self._mhc_post_fn = mhc_post_triton_full
-        else:
+        elif triton_choice is False:
             self._mhc_pre_fn = None  # legacy paths resolved inline below
+            self._mhc_post_fn = None
+        elif _is_sm120:
+            # sm_120 default: deepgemm pre-GEMM + Triton big_fuse for pre,
+            # Triton post for post (deepgemm has no MHC post kernel).
+            from sglang.jit_kernel.mhc_triton import mhc_post_triton_full
+            from sglang.srt.layers.mhc_deepgemm import mhc_pre_deepgemm
+            self._mhc_pre_fn = mhc_pre_deepgemm
+            self._mhc_post_fn = mhc_post_triton_full
+        else:
+            self._mhc_pre_fn = None
             self._mhc_post_fn = None
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
