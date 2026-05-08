@@ -90,7 +90,17 @@ def _prepare_deepgemm_mxfp4_weight(
     # `torch.int8` for the packed FP4 weight tensor).
     weight_int8 = raw_weight.view(torch.int8)
 
-    # UE8M0 byte -> FP32 scale via 2^(byte - 127).
+    # UE8M0 byte -> FP32 scale via 2^(byte - 127), then pre-pack to
+    # deepgemm's INT32 TMA-aligned layout. The packed output is ~1/4
+    # the FP32 size which matters at V4-Flash scales (~400MB → ~100MB
+    # per rank for the full E×N×K/32 scale tensor).
     scales_fp32 = torch.pow(2.0, raw_scale.to(torch.float32) - 127.0)
+    from deep_gemm import transform_sf_into_required_layout
+    num_groups, n, _ = raw_weight.shape
+    k = 2 * raw_weight.shape[2]  # nibbles → elements
+    scales_packed = transform_sf_into_required_layout(
+        scales_fp32, mn=n, k=k, recipe=(1, gran_k), num_groups=num_groups,
+    )
+    del scales_fp32  # release the transient FP32 alloc
 
-    return weight_int8, scales_fp32
+    return weight_int8, scales_packed
