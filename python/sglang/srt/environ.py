@@ -564,6 +564,13 @@ class Envs:
     # Tri-state: None → auto (use Triton on sm_120, TileLang elsewhere).
     # True/False overrides.
     SGLANG_OPT_USE_TRITON_MHC = EnvBool(None)
+    # Opt-in to deepgemm tf32_hc_prenorm_gemm for the MHC pre-GEMM step.
+    # On RTX PRO 6000 (sm_120) this kernel is ~4× slower than the Triton
+    # split-K port at every decode shape M ∈ {1..2048}, N=24, K=16384
+    # (deepgemm has a flat ~143 µs floor; Triton split-K is ~36 µs at small M
+    # — see /tmp/bench_mhc_pre.py). The deepgemm path is kept in tree as a
+    # numerical reference / opt-in debug fallback; live default is Triton.
+    SGLANG_OPT_USE_DEEPGEMM_MHC = EnvBool(False)
     SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(True)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")
     SGLANG_FLASHMLA_BACKEND = EnvStr(None)
