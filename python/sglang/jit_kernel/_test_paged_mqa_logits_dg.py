@@ -45,33 +45,31 @@ def _build_inputs(
     )
     q_fp8 = q_fp32.to(FP8_DTYPE)
 
-    # KV cache layout: [num_blocks, block_size, 1, head_dim + 4]
-    # Bytes [0, head_dim*block_size) are FP8 K values.
-    # Bytes [head_dim*block_size, total_dim) are 4 × FP32 group scales,
-    # stored as float32 in the trailing 4 columns of the per-block tile.
-    total_dim = head_dim + 4  # 132 bytes per (block, position)
-    kvcache_fp8 = torch.empty(
-        num_blocks_total, block_size, 1, total_dim, dtype=torch.uint8, device=device
+    # Live KV cache layout (split per page): page bytes [0, K_bytes) hold
+    # the FP8 K values for all `block_size` positions, page bytes
+    # [K_bytes, page_bytes) hold the per-position FP32 scales (one fp32
+    # per position). Both deepgemm and the torch reference at
+    # `compressed/indexer.py:68-84` consume this split layout; the
+    # [num_blocks, block_size, 1, head_dim+4] 4-D shape is a view, not an
+    # interleaved-per-position allocation.
+    page_bytes = block_size * (head_dim + 4)  # 8448 at block=64 d=128
+    k_bytes = block_size * head_dim           # 8192
+    flat = torch.empty(
+        num_blocks_total, page_bytes, dtype=torch.uint8, device=device
     )
-    # Fill the FP8 region with mild random fp8 values (same scaling as q
-    # to keep the torch-reference FP32 accumulation finite).
     fp8_region = (
         torch.randn(
-            num_blocks_total, block_size, 1, head_dim, generator=g, device=device
+            num_blocks_total, block_size, head_dim, generator=g, device=device
         )
         * 0.25
     ).to(FP8_DTYPE)
-    kvcache_fp8[..., :head_dim] = fp8_region.view(torch.uint8)
-    # One FP32 scale per (block, position). Each FP32 is 4 bytes, placed
-    # in the 4 trailing uint8 columns.
+    flat[:, :k_bytes] = fp8_region.reshape(num_blocks_total, k_bytes).view(torch.uint8)
     scales_fp32 = (
-        torch.rand(
-            num_blocks_total, block_size, 1, 1, generator=g, device=device
-        )
-        * 0.5
-        + 0.5  # in [0.5, 1.0] to avoid extreme dynamic range
+        torch.rand(num_blocks_total, block_size, generator=g, device=device) * 0.5
+        + 0.5
     ).contiguous()
-    kvcache_fp8[..., head_dim:] = scales_fp32.view(torch.uint8)
+    flat[:, k_bytes:] = scales_fp32.view(torch.uint8)
+    kvcache_fp8 = flat.view(num_blocks_total, block_size, 1, head_dim + 4)
 
     # weights[b, h] = compute_weights(...) * weight_scale * q_scale (already
     # fused per the live indexer). Modest range to keep torch FP32 accum finite.
