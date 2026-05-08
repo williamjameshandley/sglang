@@ -569,6 +569,9 @@ class Envs:
     # deep_gemm.m_grouped_fp8_fp4_gemm_nt_* (parity with B100/H200). Default
     # off; the existing OAI triton_kernels matmul_ogs path is the live default.
     SGLANG_OPT_USE_DEEPGEMM_MOE = EnvBool(False)
+    # D4.7.5 live tensor capture for the deepgemm MoE oracle. One-shot
+    # per process; dumps to /tmp/deepgemm_dump_<pid>.pt.
+    SGLANG_OPT_DUMP_DEEPGEMM_MOE = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")
     SGLANG_FLASHMLA_BACKEND = EnvStr(None)
     SGLANG_SPARSE_MLA_NUM_SPLITS = EnvInt(None)

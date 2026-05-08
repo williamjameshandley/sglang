@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from typing import TYPE_CHECKING, List, Optional
 
@@ -1084,6 +1085,42 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         backend = self.runner.runner_backend
         if backend.is_deep_gemm():
+            # D4.7.5 live tensor dump: enabled by SGLANG_OPT_DUMP_DEEPGEMM_MOE=1.
+            # One-shot per process: dumps the FIRST deepgemm-MoE invocation
+            # (typically layer 0, first decode step) to /tmp/deepgemm_dump_<pid>.pt
+            # for oracle replay. Guarded by a class-level flag so we don't fill disk.
+            if envs.SGLANG_OPT_DUMP_DEEPGEMM_MOE.get() and not getattr(
+                Mxfp4MoEMethod, "_dump_done", False
+            ):
+                Mxfp4MoEMethod._dump_done = True
+                topk_weights, topk_ids, router_logits = topk_output
+                dump_path = f"/tmp/deepgemm_dump_{os.getpid()}.pt"
+                torch.save({
+                    "hidden_states": x.detach().cpu(),
+                    "topk_weights": topk_weights.detach().cpu(),
+                    "topk_ids": topk_ids.detach().cpu(),
+                    "router_logits": router_logits.detach().cpu()
+                                     if router_logits is not None else None,
+                    "topk_ids_min": int(topk_ids.min()),
+                    "topk_ids_max": int(topk_ids.max()),
+                    "topk_ids_unique": int(topk_ids.unique().numel()),
+                    "topk_ids_dtype": str(topk_ids.dtype),
+                    "num_local_experts": getattr(layer, "num_local_experts", "missing"),
+                    "moe_ep_size": getattr(layer, "moe_ep_size", "missing"),
+                    "moe_ep_rank": getattr(layer, "moe_ep_rank", "missing"),
+                    "num_experts": getattr(layer, "num_experts", "missing"),
+                    "top_k": getattr(self.moe_runner_config, "top_k", "missing"),
+                    "routed_scaling_factor": self.moe_runner_config.routed_scaling_factor,
+                    "apply_router_weight_on_input": self.moe_runner_config.apply_router_weight_on_input,
+                    "w13_weight_dg_shape": tuple(layer.w13_weight_dg.shape),
+                    "w13_weight_dg_dtype": str(layer.w13_weight_dg.dtype),
+                    "w13_scale_dg_shape": tuple(layer.w13_scale_dg.shape),
+                    "w2_weight_dg_shape": tuple(layer.w2_weight_dg.shape),
+                    "w2_scale_dg_shape": tuple(layer.w2_scale_dg.shape),
+                }, dump_path)
+                import sys as _sys
+                print(f"[D4.7.5] dumped deepgemm MoE state to {dump_path}", file=_sys.stderr, flush=True)
+
             # Phase D4: V4-Flash MXFP4 routed-experts via deepgemm.
             # `process_weights_after_loading` produced layer.w13_weight_dg /
             # layer.w2_weight_dg (deepgemm B-operand) plus FP32 group-32
