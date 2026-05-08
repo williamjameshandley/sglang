@@ -569,7 +569,7 @@ class Envs:
     SGLANG_FLASHMLA_BACKEND = EnvStr(None)
     SGLANG_SPARSE_MLA_NUM_SPLITS = EnvInt(None)
     SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
-    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
+    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(True)
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
     SGLANG_OPT_USE_OVERLAP_STORE_CACHE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_SWA_PREPARE = EnvBool(True)
@@ -591,8 +591,18 @@ class Envs:
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
     SGLANG_OPT_TRITON_PREPARE_COMPRESS = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    # Explicit debug fallback to the sm_120 Triton paged MQA logits kernel.
+    # Only honored when running on sm_120; ignored otherwise to avoid routing
+    # HIP / sm_90 / sm_100 deployments through sm_120-specific PTX.
+    SGLANG_FP8_PAGED_MQA_LOGITS_TRITON_SM120 = EnvBool(False)
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
-    SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvBool(False)
+    # BF16×BF16→FP32 GEMM algo for `linear_bf16_fp32` (V4 compressor).
+    # Accepts {"cublas", "deep_gemm", "aiter", "torch"}.
+    # Default "deep_gemm": PR #324 ships sm_120 native bf16_gemm_nt; use it
+    # by default on sm_120 to match the public-deploy parity target. Other
+    # archs reach the deepgemm path too (sm_90/sm_100 already have
+    # bf16_gemm_nt dispatch upstream).
+    SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("deep_gemm")
     SGLANG_FORCE_TRITON_MOE_FP8 = EnvBool(False)
     SGLANG_OPT_USE_AITER_MHC_PRE= EnvBool(True)
     SGLANG_OPT_USE_AITER_MHC_POST= EnvBool(True)

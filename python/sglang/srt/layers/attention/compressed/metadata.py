@@ -151,13 +151,15 @@ class PagedIndexerMetadata(IndexerMetadata):
                 from sglang.srt.layers.deep_gemm_wrapper.paged_mqa_logits import (
                     get_paged_mqa_logits_metadata_chunked as get_paged_mqa_logits_metadata,
                 )
-            elif envs.SGLANG_OPT_USE_JIT_INDEXER_METADATA.get():
-                from sglang.jit_kernel.deepseek_v4 import get_paged_mqa_logits_metadata
             else:
                 from deep_gemm import get_paged_mqa_logits_metadata
 
+            # PR #324 csrc/apis/attention.hpp asserts context_lens.dim() == 2.
+            # Pass a 2-D [B, 1] view for the DeepGEMM metadata path; the
+            # downstream kernel call site reshapes the same way.
+            context_lens_2d = self.c4_seq_lens.to(torch.int32).view(-1, 1)
             self.deep_gemm_metadata = get_paged_mqa_logits_metadata(
-                self.c4_seq_lens.to(torch.int32),
+                context_lens_2d,
                 self.c4_page_size,
                 deep_gemm.get_num_sms(),
             )

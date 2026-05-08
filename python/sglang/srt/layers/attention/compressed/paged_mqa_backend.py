@@ -56,10 +56,14 @@ def get_paged_mqa_logits_backend() -> PagedMQALogitsBackend:
         # DeepGEMM metadata; treat it as a non-DeepGEMM backend so the
         # metadata/copy gates collapse to the same arm as torch.
         return PagedMQALogitsBackend.TORCH
-    if _is_sm120():
+    if envs.SGLANG_FP8_PAGED_MQA_LOGITS_TRITON_SM120.get() and _is_sm120():
+        # Explicit debug override: the sm_120 Triton kernel uses sm_120-only
+        # PTX, so the env is honored only on sm_120.
         return PagedMQALogitsBackend.TRITON_SM120
     if envs.SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE.get() != -1:
         return PagedMQALogitsBackend.DEEP_GEMM_CHUNKED
+    # sm_90 / sm_100 / sm_120 all default to DeepGEMM with PR #324's
+    # sm_120 native paged-MQA-logits dispatch.
     return PagedMQALogitsBackend.DEEP_GEMM
 
 

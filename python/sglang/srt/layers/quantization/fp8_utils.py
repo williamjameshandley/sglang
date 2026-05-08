@@ -469,8 +469,11 @@ def initialize_fp8_gemm_config(server_args: ServerArgs) -> None:
 
     backend = server_args.fp8_gemm_runner_backend
     if backend == "auto" and is_sm120_supported():
-        # TODO(brayden): Verify if CUTLASS can be set by default once SwapAB is supported
-        backend = "triton"
+        # PR #324 (deepseek-ai/DeepGEMM) ships native sm_120 dispatch in
+        # fp8_fp4_gemm_nt covering the V4-Flash FP8 block-GEMM shapes; prefer
+        # DeepGEMM over Triton on sm_120 to match the public-deploy parity
+        # target.
+        backend = "deep_gemm"
 
     FP8_GEMM_RUNNER_BACKEND = Fp8GemmRunnerBackend(backend)
 

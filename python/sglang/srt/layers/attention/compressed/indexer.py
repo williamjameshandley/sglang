@@ -542,6 +542,7 @@ class C4IndexerBackend:
         from sglang.srt.layers.attention.compressed.paged_mqa_backend import (
             PagedMQALogitsBackend,
             get_paged_mqa_logits_backend,
+            uses_deep_gemm_metadata,
         )
 
         backend = get_paged_mqa_logits_backend()
@@ -562,11 +563,19 @@ class C4IndexerBackend:
         else:
             from deep_gemm import fp8_paged_mqa_logits as fn
 
+        # PR #324 csrc/apis/attention.hpp asserts context_lens.dim() == 2
+        # for the DeepGEMM path; the Torch / TRITON_SM120 / TileLang / HIP
+        # fallbacks consume the existing 1-D shape natively.
+        if uses_deep_gemm_metadata(backend):
+            seq_lens_arg = indexer_metadata.c4_seq_lens.to(torch.int32).view(-1, 1)
+        else:
+            seq_lens_arg = indexer_metadata.c4_seq_lens
+
         logits = fn(
             q_fp8,
             c4_indexer_kv_cache,
             weights,
-            indexer_metadata.c4_seq_lens,
+            seq_lens_arg,
             indexer_metadata.page_table,
             indexer_metadata.deep_gemm_metadata,
             indexer_metadata.max_seq_len,
