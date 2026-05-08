@@ -907,11 +907,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto():
-            # Must match apply() priority: deepgemm > aiter > triton_kernels.
-            if self.use_deepgemm_moe:
-                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
-            elif _use_aiter and get_moe_a2a_backend().is_none():
+        # Phase D4: deepgemm opt-in OVERRIDES the explicit --moe-runner-backend
+        # flag. Without this, a conf with `--moe-runner-backend triton_kernel`
+        # would force triton_kernels even when SGLANG_OPT_USE_DEEPGEMM_MOE=1
+        # is set, then `apply()` would assert the OAI PCG op is registered
+        # (it isn't, because process_weights_after_loading's deepgemm branch
+        # correctly skipped registration).
+        if self.use_deepgemm_moe:
+            moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+        elif moe_runner_backend.is_auto():
+            # Must match apply() priority: aiter before triton_kernels.
+            if _use_aiter and get_moe_a2a_backend().is_none():
                 moe_runner_backend = MoeRunnerBackend.AITER
             elif self.use_triton_kernels:
                 moe_runner_backend = MoeRunnerBackend.TRITON_KERNELS
