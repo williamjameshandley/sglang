@@ -336,15 +336,53 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
         self.prefix = prefix
         self.topk_indices_dtype = None
-        self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
-        self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
-        # Phase D4: opt-in to deepgemm m_grouped_fp8_fp4_gemm_nt_* for V4-Flash
-        # MXFP4 routed experts on sm_120. Default off (pre-D4 behaviour); set
-        # SGLANG_OPT_USE_DEEPGEMM_MOE=1 to enable. Achieves parity with public
-        # B100/H200 deployments. Requires `_prepare_deepgemm_mxfp4_weight` to
-        # convert checkpoint MXFP4 → deepgemm B-operand layout (D4.1 helper).
-        self.use_deepgemm_moe = envs.SGLANG_OPT_USE_DEEPGEMM_MOE.get()
+
+        # Resolve the execution backend ONCE. All other booleans
+        # (use_triton_kernels, use_flashinfer, use_deepgemm_moe, _use_aiter)
+        # derive from this single resolution so process_weights_after_loading,
+        # create_moe_runner, and apply() can never disagree about which path
+        # to take.
+        #
+        # Resolution priority (most specific first):
+        #   1. SGLANG_OPT_USE_DEEPGEMM_MOE=1 → DEEP_GEMM (V4-Flash MXFP4 parity).
+        #      Overrides explicit --moe-runner-backend; emits a warning when
+        #      the explicit flag is non-default.
+        #   2. --moe-runner-backend=flashinfer_mxfp4 → FLASHINFER_MXFP4.
+        #   3. ROCm + SGLANG_USE_AITER + a2a-none → AITER.
+        #   4. --moe-runner-backend=triton_kernel → TRITON_KERNELS (OAI MXFP4).
+        #   5. otherwise → TRITON (BF16 fallback).
+        explicit_backend = get_moe_runner_backend()
+        if envs.SGLANG_OPT_USE_DEEPGEMM_MOE.get():
+            self._resolved_backend = MoeRunnerBackend.DEEP_GEMM
+            if not explicit_backend.is_auto():
+                # Single-line warning so the override is visible in startup logs.
+                import warnings
+                warnings.warn(
+                    "SGLANG_OPT_USE_DEEPGEMM_MOE=1 overrides "
+                    f"--moe-runner-backend={explicit_backend.value} "
+                    "for Mxfp4MoEMethod (V4-Flash deepgemm parity path)."
+                )
+        elif explicit_backend.is_flashinfer_mxfp4():
+            self._resolved_backend = MoeRunnerBackend.FLASHINFER_MXFP4
+        elif _use_aiter and get_moe_a2a_backend().is_none():
+            self._resolved_backend = MoeRunnerBackend.AITER
+        elif explicit_backend.is_triton_kernels():
+            self._resolved_backend = MoeRunnerBackend.TRITON_KERNELS
+        elif explicit_backend.is_auto():
+            self._resolved_backend = MoeRunnerBackend.TRITON_KERNELS
+        else:
+            self._resolved_backend = MoeRunnerBackend.TRITON
+
+        # Compatibility booleans derived from the resolved backend.
+        self.use_triton_kernels = (
+            self._resolved_backend is MoeRunnerBackend.TRITON_KERNELS
+        )
+        self.use_flashinfer = (
+            self._resolved_backend is MoeRunnerBackend.FLASHINFER_MXFP4
+        )
+        self.use_deepgemm_moe = self._resolved_backend is MoeRunnerBackend.DEEP_GEMM
+
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
         )
@@ -906,23 +944,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-        # Phase D4: deepgemm opt-in OVERRIDES the explicit --moe-runner-backend
-        # flag. Without this, a conf with `--moe-runner-backend triton_kernel`
-        # would force triton_kernels even when SGLANG_OPT_USE_DEEPGEMM_MOE=1
-        # is set, then `apply()` would assert the OAI PCG op is registered
-        # (it isn't, because process_weights_after_loading's deepgemm branch
-        # correctly skipped registration).
-        if self.use_deepgemm_moe:
-            moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
-        elif moe_runner_backend.is_auto():
-            # Must match apply() priority: aiter before triton_kernels.
-            if _use_aiter and get_moe_a2a_backend().is_none():
-                moe_runner_backend = MoeRunnerBackend.AITER
-            elif self.use_triton_kernels:
-                moe_runner_backend = MoeRunnerBackend.TRITON_KERNELS
-            else:
-                moe_runner_backend = MoeRunnerBackend.TRITON
+        # Use the single resolution computed at __init__ time. This MUST agree
+        # with self.use_triton_kernels / self.use_flashinfer / self.use_deepgemm_moe
+        # because they're all derived from self._resolved_backend.
+        moe_runner_backend = self._resolved_backend
 
         if moe_runner_backend.is_aiter():
             # MXFP4 hard-codes Swiglu in the AITER kernel path.
@@ -1080,13 +1105,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 block_shape=[1, 128],  # FP8 activation group_size=128
                 use_fp4=True,
             )
-            combine_input = self.runner.run(dispatch_output, quant_info)
-            # Apply routed_scaling_factor — V4-Flash uses 2.5. Matches the
-            # rsf reapplication in the triton_kernels branch below.
-            rsf = self.moe_runner_config.routed_scaling_factor
-            if rsf is not None and rsf != 1.0:
-                combine_input.hidden_states = combine_input.hidden_states * rsf
-            return combine_input
+            # `MoeRunner.run` invokes `post_permute_deep_gemm_to_standard`
+            # (registered via @register_post_permute), which already applies
+            # `runner_config.routed_scaling_factor`. Do NOT scale again here:
+            # the OAI triton_kernels branch below scales manually because it
+            # bypasses MoeRunner.run; the deepgemm branch does not bypass it.
+            return self.runner.run(dispatch_output, quant_info)
 
         if backend.is_triton_kernels():
             # Bypass MoeRunner.run / pre_permute_standard_to_triton_kernels
