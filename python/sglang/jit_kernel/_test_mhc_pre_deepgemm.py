@@ -64,10 +64,10 @@ def main() -> int:
         2049,
     ]
 
-    from sglang.srt.layers.mhc_deepgemm import deepgemm_hc_pre_gemm
+    from sglang.srt.layers.mhc_deepgemm import deepgemm_hc_pre_gemm_splitk
 
     print("=" * 60)
-    print("D3 MHC pre-GEMM: deepgemm vs torch reference")
+    print("D3 MHC pre-GEMM: deepgemm split-K vs torch reference")
     print(f"  hc_mult={hc_mult} hidden={hidden} hc_mult3={hc_mult3}")
     print("=" * 60)
 
@@ -89,8 +89,12 @@ def main() -> int:
         ref_out = F.linear(x_flat.float(), fn)
         ref_sqr = x_flat.float().square().sum(dim=-1)
 
-        # Deepgemm: a=BF16 K-major, b=FP32 K-major, out=FP32 N-major.
-        dg_out, dg_sqr = deepgemm_hc_pre_gemm(x_flat, fn)
+        # Deepgemm split-K: 3D `[S, M, N]` and 2D `[S, M]` partials —
+        # sum across S to compare against the torch reference.
+        S = 32
+        dg_out_3d, dg_sqr_2d = deepgemm_hc_pre_gemm_splitk(x_flat, fn, num_splits=S)
+        dg_out = dg_out_3d.sum(dim=0)
+        dg_sqr = dg_sqr_2d.sum(dim=0)
 
         out_abs, out_rel = _max_rel_abs(dg_out, ref_out)
         sqr_abs, sqr_rel = _max_rel_abs(dg_sqr, ref_sqr)

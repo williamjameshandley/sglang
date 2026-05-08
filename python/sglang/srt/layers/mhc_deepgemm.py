@@ -6,15 +6,33 @@ deepgemm path stays free of the TileLang import at module top
 
 Two layers exposed:
 
-- `deepgemm_hc_pre_gemm(x_flat, fn) -> (gemm_out, sqrsum)`: thin
-  wrapper around `deep_gemm.tf32_hc_prenorm_gemm`. Same `(out,
-  sqrsum)` contract the existing `mhc_pre_big_fuse_triton` consumes.
+- `deepgemm_hc_pre_gemm_splitk(x_flat, fn, num_splits)`: thin wrapper
+  around `deep_gemm.tf32_hc_prenorm_gemm` with explicit split-K.
+  Returns 3D `gemm_out [S, M, N]` and 2D `sqrsum [S, M]` partials —
+  the same layout `mhc_pre_big_fuse_triton` consumes when called
+  with `n_splits=S>1`.
 - `mhc_pre_deepgemm(residual, fn, ...) -> (post, comb, layer_input)`:
   full resolved callable; binds to `self._mhc_pre_fn` in
   `DeepseekV4DecoderLayer.__init__`. Body calls
-  `deepgemm_hc_pre_gemm` for the GEMM step and
+  `deepgemm_hc_pre_gemm_splitk` for the GEMM step and
   `mhc_pre_big_fuse_triton` for the sinkhorn + per-head normalization
-  + output combination step (deepgemm has no big_fuse equivalent).
+  + output combination + split-K reduction step.
+
+## Why num_splits matters
+
+The sm_120 `tf32_hc_prenorm_gemm` kernel sets `BLOCK_M=128` and grid =
+`ceil_div(M, 128) * num_splits`. With `num_splits=None` (i.e. 1) and
+`M<=128` (V4-Flash decode), grid_size==1 — a single CTA serializes
+all 256 K-blocks (K=16384, BLOCK_K=64). That leaves 83 of 84 SMs idle
+on RTX PRO 6000 and produces a flat ~143 µs floor regardless of M.
+
+With `num_splits=32` the same shape gets 32 CTAs of work and drops
+to ~7 µs. With `num_splits=128`, ~4 µs. End-to-end (GEMM + big_fuse
+reduction) at decode shapes the deepgemm split-K path is ~33 µs vs
+the Triton path's ~67 µs — a 2× win.
+
+See `_test_mhc_pre_deepgemm.py` and `/tmp/bench_mhc_pre_full.py` for
+the data backing the `num_splits=32` default below.
 """
 
 from __future__ import annotations
@@ -24,23 +42,31 @@ from typing import Tuple
 import torch
 
 
-def deepgemm_hc_pre_gemm(
+# Default split-K factor for V4-Flash decode shapes. S=32 gives near-best
+# end-to-end at every M ∈ {1..2048}; S=128 wins at small M but loses at
+# M=2048 (more partials than the big_fuse reduction can amortize).
+_DEFAULT_NUM_SPLITS_DECODE = 32
+
+
+def deepgemm_hc_pre_gemm_splitk(
     x_flat: torch.Tensor,
     fn: torch.Tensor,
+    num_splits: int = _DEFAULT_NUM_SPLITS_DECODE,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """BF16 × FP32 → FP32 GEMM with per-row sum-of-squares.
-
-    `a` is BF16 [m, k] K-major; `b` is FP32 [n, k] K-major. Output `d`
-    is FP32 [m, n] N-major; `sqr_sum` is FP32 [m] holding the per-row
-    sum-of-squares of `a` (the input rows fed into the GEMM).
+    """BF16 × FP32 → FP32 GEMM with per-row sum-of-squares, split-K.
 
     Args:
-        x_flat: [num_tokens, hc_hidden_size] BF16, K-major.
-        fn:     [hc_mult3, hc_hidden_size]   FP32, K-major.
+        x_flat: [M, K] BF16, K-major (M = num_tokens, K = hc_hidden_size).
+        fn:     [N, K] FP32, K-major (N = hc_mult3).
+        num_splits: split-K factor. Public API requires 3D `d`/2D
+            `sqr_sum` whenever this is provided. Each split holds the
+            partial GEMM output for K-segment `[s*K/S .. (s+1)*K/S)`
+            and the partial sum-of-squares for the same K-segment.
+            `mhc_pre_big_fuse_triton` reduces all S splits.
 
     Returns:
-        gemm_out: [num_tokens, hc_mult3] FP32, N-major contiguous.
-        sqrsum:   [num_tokens]            FP32 contiguous.
+        gemm_out: [S, M, N] FP32 partials, contiguous.
+        sqrsum:   [S, M]    FP32 partials, contiguous.
     """
     assert x_flat.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
@@ -48,20 +74,23 @@ def deepgemm_hc_pre_gemm(
     assert x_flat.shape[1] == fn.shape[1], (
         f"K mismatch: x_flat.shape[1]={x_flat.shape[1]} vs fn.shape[1]={fn.shape[1]}"
     )
+    assert num_splits >= 1
 
     import deep_gemm
 
-    num_tokens, _ = x_flat.shape
-    hc_mult3, _ = fn.shape
+    M, _ = x_flat.shape
+    N, _ = fn.shape
 
     gemm_out = torch.empty(
-        num_tokens, hc_mult3, dtype=torch.float32, device=x_flat.device,
+        num_splits, M, N, dtype=torch.float32, device=x_flat.device,
     )
     sqrsum = torch.empty(
-        num_tokens, dtype=torch.float32, device=x_flat.device,
+        num_splits, M, dtype=torch.float32, device=x_flat.device,
     )
 
-    deep_gemm.tf32_hc_prenorm_gemm(x_flat, fn, gemm_out, sqrsum)
+    deep_gemm.tf32_hc_prenorm_gemm(
+        x_flat, fn, gemm_out, sqrsum, num_splits=num_splits,
+    )
     return gemm_out, sqrsum
 
 
@@ -76,23 +105,26 @@ def mhc_pre_deepgemm(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     n_splits: int = 1,
-    n_splits_pre: int = 32,
+    n_splits_pre: int = _DEFAULT_NUM_SPLITS_DECODE,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Drop-in deepgemm-backed replacement for `mhc_pre_triton`.
 
-    Same dispatch tree as the Triton path: GEMM via
-    `deep_gemm.tf32_hc_prenorm_gemm` instead of the Triton split-K /
-    simple kernel; everything else (sinkhorn + per-head normalization
-    + output combination) reuses the existing `mhc_pre_big_fuse_triton`
-    Triton kernel because deepgemm has no big_fuse equivalent.
+    GEMM via `deep_gemm.tf32_hc_prenorm_gemm` with `num_splits=n_splits_pre`;
+    sinkhorn + per-head normalization + split-K reduction + output
+    combination via `mhc_pre_big_fuse_triton` (deepgemm has no big_fuse
+    equivalent).
+
+    The `n_splits` parameter is the OUTER reduction factor consumed by
+    the original `mhc_pre_triton` interface (1 by default; the Triton
+    split-K wrapper produced 1 split internally and the big_fuse
+    interface re-uses `n_splits` to mean "outer split factor"). For
+    deepgemm we use `n_splits_pre` as the GEMM-internal split factor;
+    big_fuse then reduces those `n_splits_pre` partials.
 
     Returns (post_mix [..., hc_mult, 1], comb_mix [..., hc_mult,
     hc_mult], layer_input [..., hidden]).
     """
-    # n_splits_pre is part of the Triton split-K wrapper signature; the
-    # deepgemm GEMM does not take a comparable knob (it does its own
-    # split-K internally when num_splits is unset).
-    del n_splits_pre
+    del n_splits  # The legacy "outer" split factor; we use n_splits_pre.
 
     from sglang.jit_kernel.mhc_triton import mhc_pre_big_fuse_triton
 
@@ -109,7 +141,6 @@ def mhc_pre_deepgemm(
     assert fn.shape == (hc_mult3, hc_hidden_size)
     assert hc_scale.shape == (3,)
     assert hc_base.shape == (hc_mult3,)
-    assert n_splits == 1, "deepgemm path supports n_splits == 1 only"
 
     outer_shape = residual.shape[:-2]
     residual_flat = residual.view(-1, hc_mult, hidden_size)
@@ -131,23 +162,24 @@ def mhc_pre_deepgemm(
         layer_input = layer_input.view(*outer_shape, hidden_size)
         return post_mix, comb_mix, layer_input
 
-    # Stage 1: GEMM + sum-of-squares via deepgemm.
+    # Stage 1: split-K GEMM + per-row sum-of-squares via deepgemm.
+    # 3D output [S, M, hc_mult3]; 2D sqrsum [S, M].
     x_flat = residual_flat.view(num_tokens, hc_hidden_size)
-    gemm_out_2d, gemm_sqr_1d = deepgemm_hc_pre_gemm(x_flat, fn)
+    gemm_out_3d, gemm_sqr_2d = deepgemm_hc_pre_gemm_splitk(
+        x_flat, fn, num_splits=n_splits_pre,
+    )
 
-    # big_fuse expects [n_splits, n_tokens, hc_mult3] and [n_splits, n_tokens].
-    gemm_out_mul = gemm_out_2d.unsqueeze(0)        # [1, n, hc_mult3]
-    gemm_out_sqrsum = gemm_sqr_1d.unsqueeze(0)     # [1, n]
-
+    # Stage 2: big_fuse reduces the S K-partials, applies sinkhorn,
+    # per-head normalization, and writes (post, comb, layer_input).
     mhc_pre_big_fuse_triton(
-        gemm_out_mul, gemm_out_sqrsum, hc_scale, hc_base, residual_flat,
+        gemm_out_3d, gemm_sqr_2d, hc_scale, hc_base, residual_flat,
         post_mix, comb_mix, layer_input,
         hidden_size=hidden_size,
         rms_eps=rms_eps, hc_pre_eps=hc_pre_eps,
         hc_sinkhorn_eps=hc_sinkhorn_eps,
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
-        n_splits=n_splits, hc_mult=hc_mult,
+        n_splits=n_splits_pre, hc_mult=hc_mult,
     )
 
     post_mix = post_mix.view(*outer_shape, hc_mult, 1)

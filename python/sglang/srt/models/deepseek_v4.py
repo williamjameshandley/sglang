@@ -1854,23 +1854,22 @@ class DeepseekV4DecoderLayer(nn.Module):
         # not see TileLang's `inspect.getsourcelines()` introspection).
         #
         # MHC pre-GEMM resolution priority on sm_120:
-        #   1. SGLANG_OPT_USE_TRITON_MHC=True       → Triton MHC pre-GEMM.
-        #   2. SGLANG_OPT_USE_TRITON_MHC=False      → legacy inline dispatch
-        #                                             (TileLang / AITER / DeepGEMM / torch).
-        #   3. SGLANG_OPT_USE_DEEPGEMM_MHC=True     → DeepGEMM `tf32_hc_prenorm_gemm`
-        #                                             via `mhc_pre_deepgemm`
-        #                                             (opt-in numerical reference;
-        #                                             slow on sm_120 — see env doc).
-        #   4. Default on sm_120                    → Triton MHC pre-GEMM.
-        #      DeepGEMM's tf32_hc_prenorm_gemm has a ~143 µs floor at every M
-        #      we hit on RTX PRO 6000; Triton split-K is ~36 µs at small M.
-        #      Live ablation: D2-deepgemm + D3-Triton 16.04 tok/s vs
-        #      D2-deepgemm + D3-deepgemm 13.49 tok/s (-16% from D3).
+        #   1. SGLANG_OPT_USE_TRITON_MHC=True  → Triton MHC pre-GEMM.
+        #   2. SGLANG_OPT_USE_TRITON_MHC=False → legacy inline dispatch
+        #      (TileLang / AITER / DeepGEMM / torch).
+        #   3. Default (None) on sm_120 → DeepGEMM `tf32_hc_prenorm_gemm`
+        #      via `mhc_pre_deepgemm` with explicit `num_splits=32`. The
+        #      naïve `num_splits=None` path launches 1 CTA total at M≤128
+        #      on RTX PRO 6000 (BLOCK_M=128, grid=ceil_div(M,128)*1=1)
+        #      and is 4× slower than Triton split-K. With `num_splits=32`
+        #      it's 8× faster than Triton at the GEMM, 2× faster end-to-end
+        #      including the big_fuse reduction. See
+        #      python/sglang/srt/layers/mhc_deepgemm.py docstring and
+        #      /tmp/bench_mhc_pre_full.py for the data.
         #
         # MHC post resolution: deepgemm has no equivalent, so the Triton
         # post wrapper stays the sm_120 default unless explicitly disabled.
         triton_choice = envs.SGLANG_OPT_USE_TRITON_MHC.get()
-        deepgemm_choice = envs.SGLANG_OPT_USE_DEEPGEMM_MHC.get()
         try:
             _major, _ = torch.cuda.get_device_capability()
             _is_sm120 = (_major == 12)  # desktop Blackwell
@@ -1887,19 +1886,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         elif triton_choice is False:
             self._mhc_pre_fn = None  # legacy paths resolved inline below
             self._mhc_post_fn = None
-        elif deepgemm_choice and _is_sm120:
-            # Opt-in: deepgemm pre-GEMM + Triton big_fuse for pre, Triton post.
+        elif _is_sm120:
+            # sm_120 default: deepgemm split-K pre-GEMM + Triton big_fuse,
+            # Triton post (deepgemm has no MHC post kernel).
             from sglang.jit_kernel.mhc_triton import mhc_post_triton_full
             from sglang.srt.layers.mhc_deepgemm import mhc_pre_deepgemm
             self._mhc_pre_fn = mhc_pre_deepgemm
-            self._mhc_post_fn = mhc_post_triton_full
-        elif _is_sm120:
-            # sm_120 default: Triton MHC pre-GEMM (fastest at our shapes).
-            from sglang.jit_kernel.mhc_triton import (
-                mhc_post_triton_full,
-                mhc_pre_triton,
-            )
-            self._mhc_pre_fn = mhc_pre_triton
             self._mhc_post_fn = mhc_post_triton_full
         else:
             self._mhc_pre_fn = None
