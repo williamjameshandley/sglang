@@ -23,6 +23,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -338,6 +339,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
+        # Phase D4: opt-in to deepgemm m_grouped_fp8_fp4_gemm_nt_* for V4-Flash
+        # MXFP4 routed experts on sm_120. Default off (pre-D4 behaviour); set
+        # SGLANG_OPT_USE_DEEPGEMM_MOE=1 to enable. Achieves parity with public
+        # B100/H200 deployments. Requires `_prepare_deepgemm_mxfp4_weight` to
+        # convert checkpoint MXFP4 → deepgemm B-operand layout (D4.1 helper).
+        self.use_deepgemm_moe = envs.SGLANG_OPT_USE_DEEPGEMM_MOE.get()
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
         )
@@ -714,6 +721,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             return
 
+        if self.use_deepgemm_moe:
+            # Phase D4: convert checkpoint MXFP4 weights to deepgemm B-operand
+            # layout. Stash on `layer.w13_weight_dg` / `layer.w2_weight_dg`
+            # plus their FP32 scales for the runner to consume. The original
+            # `layer.w13_weight` / `layer.w2_weight` (uint8 nibbles) are
+            # released — we'd otherwise carry both copies in memory.
+            from sglang.srt.layers.moe.fused_moe_triton.deepgemm_mxfp4_weight import (
+                _prepare_deepgemm_mxfp4_weight,
+            )
+            w13_weight_dg, w13_scale_dg = _prepare_deepgemm_mxfp4_weight(
+                layer.w13_weight, layer.w13_weight_scale, role="w13", gran_k=32,
+            )
+            w2_weight_dg, w2_scale_dg = _prepare_deepgemm_mxfp4_weight(
+                layer.w2_weight, layer.w2_weight_scale, role="w2", gran_k=32,
+            )
+            layer.w13_weight_dg = Parameter(w13_weight_dg, requires_grad=False)
+            layer.w13_scale_dg = Parameter(w13_scale_dg, requires_grad=False)
+            layer.w2_weight_dg = Parameter(w2_weight_dg, requires_grad=False)
+            layer.w2_scale_dg = Parameter(w2_scale_dg, requires_grad=False)
+            del layer.w13_weight
+            del layer.w2_weight
+            del layer.w13_weight_scale
+            del layer.w2_weight_scale
+            torch.cuda.empty_cache()
+            # Skip the per-layer PCG custom op registration: the deepgemm
+            # path goes through the standard MoeRunner, not the V4-Flash
+            # OAI-specific PCG bypass.
+            return
+
         if self.use_triton_kernels:
 
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
@@ -872,8 +908,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
-            # Must match apply() priority: _use_aiter before use_triton_kernels.
-            if _use_aiter and get_moe_a2a_backend().is_none():
+            # Must match apply() priority: deepgemm > aiter > triton_kernels.
+            if self.use_deepgemm_moe:
+                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+            elif _use_aiter and get_moe_a2a_backend().is_none():
                 moe_runner_backend = MoeRunnerBackend.AITER
             elif self.use_triton_kernels:
                 moe_runner_backend = MoeRunnerBackend.TRITON_KERNELS
@@ -885,6 +923,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self.runner = MoeRunner(
                 moe_runner_backend, replace(moe_runner_config, activation="swiglu")
             )
+        elif moe_runner_backend.is_deep_gemm():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         elif moe_runner_backend.is_triton_kernels() or moe_runner_backend.is_triton():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
@@ -1012,6 +1052,36 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             )
 
         backend = self.runner.runner_backend
+        if backend.is_deep_gemm():
+            # Phase D4: V4-Flash MXFP4 routed-experts via deepgemm.
+            # `process_weights_after_loading` produced layer.w13_weight_dg /
+            # layer.w2_weight_dg (deepgemm B-operand) plus FP32 group-32
+            # scales. The standard pre_permute (registered via @register_pre_permute
+            # in moe_runner/deep_gemm.py:399) handles activation FP8
+            # quantization + grouped layout. The runner's `_run_masked_gemm`
+            # (or `_run_contiguous_gemm` if dispatched contiguous) sees
+            # use_fp4=True on quant_info and dispatches to
+            # m_grouped_fp8_fp4_gemm_nt_*.
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+                DeepGemmMoeQuantInfo,
+            )
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight_dg,
+                w2_weight=layer.w2_weight_dg,
+                use_fp8=False,  # weights are FP4, not FP8
+                w13_scale=layer.w13_scale_dg,
+                w2_scale=layer.w2_scale_dg,
+                block_shape=[1, 128],  # FP8 activation group_size=128
+                use_fp4=True,
+            )
+            combine_input = self.runner.run(dispatch_output, quant_info)
+            # Apply routed_scaling_factor — V4-Flash uses 2.5. Matches the
+            # rsf reapplication in the triton_kernels branch below.
+            rsf = self.moe_runner_config.routed_scaling_factor
+            if rsf is not None and rsf != 1.0:
+                combine_input.hidden_states = combine_input.hidden_states * rsf
+            return combine_input
+
         if backend.is_triton_kernels():
             # Bypass MoeRunner.run / pre_permute_standard_to_triton_kernels
             # to keep RoutingData / SparseMatrix / PrecisionConfig out of

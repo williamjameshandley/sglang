@@ -565,6 +565,10 @@ class Envs:
     # True/False overrides.
     SGLANG_OPT_USE_TRITON_MHC = EnvBool(None)
     SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(True)
+    # Phase D4 opt-in: route V4-Flash MXFP4 routed-experts MoE through
+    # deep_gemm.m_grouped_fp8_fp4_gemm_nt_* (parity with B100/H200). Default
+    # off; the existing OAI triton_kernels matmul_ogs path is the live default.
+    SGLANG_OPT_USE_DEEPGEMM_MOE = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")
     SGLANG_FLASHMLA_BACKEND = EnvStr(None)
     SGLANG_SPARSE_MLA_NUM_SPLITS = EnvInt(None)
