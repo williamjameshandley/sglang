@@ -565,11 +565,17 @@ class C4IndexerBackend:
 
         # PR #324 csrc/apis/attention.hpp asserts context_lens.dim() == 2
         # for the DeepGEMM path; the Torch / TRITON_SM120 / TileLang / HIP
-        # fallbacks consume the existing 1-D shape natively.
+        # fallbacks consume the existing 1-D shape natively. DeepGEMM also
+        # uses `max_context_len` for grid scheduling, so the C4-compressed
+        # max length must be passed (not the raw-page `max_seq_len` which
+        # is 4× larger). The Triton sm_120 wrapper used raw-page length
+        # for output allocation only; deepgemm hangs if given that value.
         if uses_deep_gemm_metadata(backend):
             seq_lens_arg = indexer_metadata.c4_seq_lens.to(torch.int32).view(-1, 1)
+            max_seq_len_arg = indexer_metadata.c4_max_seq_len
         else:
             seq_lens_arg = indexer_metadata.c4_seq_lens
+            max_seq_len_arg = indexer_metadata.max_seq_len
 
         logits = fn(
             q_fp8,
@@ -578,7 +584,7 @@ class C4IndexerBackend:
             seq_lens_arg,
             indexer_metadata.page_table,
             indexer_metadata.deep_gemm_metadata,
-            indexer_metadata.max_seq_len,
+            max_seq_len_arg,
             False,
         )
 

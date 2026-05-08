@@ -180,6 +180,20 @@ class PagedIndexerMetadata(IndexerMetadata):
     def max_seq_len(self) -> int:
         return self.page_table.shape[1] * self.page_size
 
+    @property
+    def c4_max_seq_len(self) -> int:
+        """Compressed-page length expected by the paged-MQA logits kernel.
+
+        The C4 indexer cache uses `c4_page_size = page_size // 4 = 64`
+        bytes per compressed token, so the kernel-side max context length
+        is `page_table.shape[1] * c4_page_size`. The Triton sm_120 wrapper
+        used `max_seq_len` (raw `page_size`) for output-allocation only
+        and computed over `max_pages * block_size` internally; deepgemm's
+        `fp8_paged_mqa_logits` uses `max_context_len` for grid scheduling,
+        so passing the raw-page value 4× too large stalls the kernel.
+        """
+        return self.page_table.shape[1] * self.c4_page_size
+
     def copy_(self, other: "PagedIndexerMetadata"):
         from sglang.srt.layers.attention.compressed.paged_mqa_backend import (
             get_paged_mqa_logits_backend,
