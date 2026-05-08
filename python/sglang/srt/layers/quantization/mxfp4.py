@@ -1133,6 +1133,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.moe_runner.deep_gemm import (
                 DeepGemmMoeQuantInfo,
             )
+            # If we just dumped, ALSO capture the runner output for offline diff.
+            _do_dump_output = (
+                envs.SGLANG_OPT_DUMP_DEEPGEMM_MOE.get()
+                and getattr(Mxfp4MoEMethod, "_dump_done", False)
+                and not getattr(Mxfp4MoEMethod, "_dump_output_done", False)
+            )
             quant_info = DeepGemmMoeQuantInfo(
                 w13_weight=layer.w13_weight_dg,
                 w2_weight=layer.w2_weight_dg,
@@ -1147,7 +1153,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # `runner_config.routed_scaling_factor`. Do NOT scale again here:
             # the OAI triton_kernels branch below scales manually because it
             # bypasses MoeRunner.run; the deepgemm branch does not bypass it.
-            return self.runner.run(dispatch_output, quant_info)
+            combine_input = self.runner.run(dispatch_output, quant_info)
+            if _do_dump_output:
+                Mxfp4MoEMethod._dump_output_done = True
+                dump_path = f"/tmp/deepgemm_dumpout_{os.getpid()}.pt"
+                torch.save({
+                    "deepgemm_output": combine_input.hidden_states.detach().cpu(),
+                }, dump_path)
+                import sys as _sys
+                print(f"[D4.7.5] dumped deepgemm output to {dump_path}",
+                      file=_sys.stderr, flush=True)
+            return combine_input
 
         if backend.is_triton_kernels():
             # Bypass MoeRunner.run / pre_permute_standard_to_triton_kernels
