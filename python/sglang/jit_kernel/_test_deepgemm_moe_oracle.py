@@ -335,11 +335,17 @@ def deepgemm_single_gemm(
 
 
 # ---------------------------------------------------------------------------
-# Comparison utility.
+# Comparison utilities.
 # ---------------------------------------------------------------------------
 
 def calc_diff(a: torch.Tensor, b: torch.Tensor) -> float:
-    """Cosine-similarity-style diff matching deepgemm's testing.numeric.calc_diff."""
+    """Cosine-similarity-style diff matching deepgemm's testing.numeric.calc_diff.
+
+    NOTE: cosine-only — BLIND to magnitude errors. A tensor that is exactly
+    `2 * ref` has calc_diff == 0. Use `compare_metrics` instead for any
+    acceptance gate where magnitude correctness matters (which is all of
+    them in D4.7 — a uniform scale error is exactly the live bug class).
+    """
     af = a.float().flatten()
     bf = b.float().flatten()
     finite = torch.isfinite(af) & torch.isfinite(bf)
@@ -349,6 +355,71 @@ def calc_diff(a: torch.Tensor, b: torch.Tensor) -> float:
     bf = bf[finite]
     cos = (af * bf).sum() / (af.norm() * bf.norm() + 1e-12)
     return float((1.0 - cos).item())
+
+
+def compare_metrics(test: torch.Tensor, ref: torch.Tensor) -> dict:
+    """Direction + magnitude diff metrics. PASS gate combines both.
+
+    `alpha` is the least-squares scalar that best fits test ≈ alpha * ref;
+    `rel_resid_after_alpha` is the residual after that scaling. A live
+    `alpha=1.94` with small `rel_resid_after_alpha` means a near-uniform
+    multiplicative bug.
+    """
+    nan_dict = {k: float("nan") for k in (
+        "cos", "calc_diff", "alpha", "norm_ratio", "rel_l2",
+        "rel_resid_after_alpha", "abs_max", "abs_mean",
+        "ratio_mean_abs_ref_gt_1", "ratio_std_abs_ref_gt_1",
+    )}
+    t = test.float().flatten()
+    r = ref.float().flatten()
+    finite = torch.isfinite(t) & torch.isfinite(r)
+    t = t[finite]
+    r = r[finite]
+    if t.numel() == 0:
+        return nan_dict
+    cos = (t * r).sum() / (t.norm() * r.norm() + 1e-12)
+    rr = (r * r).sum().clamp_min(1e-12)
+    alpha = (t * r).sum() / rr
+    norm_ratio = t.norm() / r.norm().clamp_min(1e-12)
+    rel_l2 = (t - r).norm() / r.norm().clamp_min(1e-12)
+    resid = t - alpha * r
+    rel_resid_after_alpha = resid.norm() / t.norm().clamp_min(1e-12)
+    abs_diff = (t - r).abs()
+    mask = r.abs() > 1.0
+    if mask.any():
+        ratio = t[mask] / r[mask]
+        ratio_mean = float(ratio.mean())
+        ratio_std = float(ratio.std()) if ratio.numel() > 1 else 0.0
+    else:
+        ratio_mean = float("nan")
+        ratio_std = float("nan")
+    return {
+        "cos": float(cos),
+        "calc_diff": float(1.0 - cos),
+        "alpha": float(alpha),
+        "norm_ratio": float(norm_ratio),
+        "rel_l2": float(rel_l2),
+        "rel_resid_after_alpha": float(rel_resid_after_alpha),
+        "abs_max": float(abs_diff.max()),
+        "abs_mean": float(abs_diff.mean()),
+        "ratio_mean_abs_ref_gt_1": ratio_mean,
+        "ratio_std_abs_ref_gt_1": ratio_std,
+    }
+
+
+def verdict(m: dict, *, calc_diff_max=1e-2, alpha_tol=0.05, rel_l2_max=0.10) -> str:
+    """PASS gate: direction AND magnitude AND L2 must agree."""
+    if m["calc_diff"] != m["calc_diff"]:  # NaN
+        return "NAN"
+    if (m["calc_diff"] < calc_diff_max
+        and abs(m["alpha"] - 1.0) < alpha_tol
+        and m["rel_l2"] < rel_l2_max):
+        return "PASS"
+    if m["calc_diff"] < calc_diff_max and abs(m["alpha"] - 1.0) >= alpha_tol:
+        return f"MAG_ERR(α={m['alpha']:.3f})"
+    if m["calc_diff"] < 5e-2:
+        return "WEAK"
+    return "FAIL"
 
 
 # ---------------------------------------------------------------------------
@@ -455,10 +526,14 @@ def deepgemm_two_gemm(
     return out[:M].contiguous()
 
 
-def mode2_two_gemm(expert_id: int = 0, M_values: tuple = (8, 64)) -> dict:
+def mode2_two_gemm(expert_id: int = 0, M_values: tuple = (8, 64),
+                    rank: int = 0) -> dict:
     """Test all 6 gate/up conventions for w13 paired with the canonical
     w2. Each (convention, gate_first_half) combination is run; the
-    correct one is the one where deepgemm matches BF16 reference."""
+    correct one is the one where deepgemm matches BF16 reference.
+
+    `rank` slices to per-rank weights for TP=2 (matches live geometry).
+    """
     weights = _load_expert_weights(expert_id)
     device = "cuda:0"
     torch.manual_seed(0xD4D4D4)
@@ -469,11 +544,15 @@ def mode2_two_gemm(expert_id: int = 0, M_values: tuple = (8, 64)) -> dict:
         )
         for M in M_values
     ]
-    w2_w, w2_s = weights["w2_w"], weights["w2_s"]
+    rank_w = _rank_shard_components(weights, rank=rank, tp=2)
+    w2_w, w2_s = rank_w["w2_w"], rank_w["w2_s"]
 
     results = []
     for gate_up in GATE_UP_CONVENTIONS:
-        w13_w, w13_s = build_w13(weights, gate_up)
+        # Shard components first, then build the gate/up convention on
+        # the rank-local w1/w3. This is the only valid order for
+        # interleaved / AITER / FlashInfer-style row permutations.
+        w13_w, w13_s = build_w13(rank_w, gate_up)
         for gate_first in (True, False):
             for M_idx, M in enumerate(M_values):
                 a = a_list[M_idx]
@@ -484,16 +563,21 @@ def mode2_two_gemm(expert_id: int = 0, M_values: tuple = (8, 64)) -> dict:
                     test = deepgemm_two_gemm(
                         w13_w, w13_s, w2_w, w2_s, a, gate_first_half=gate_first,
                     )
-                    diff = calc_diff(test.float(), ref.float())
-                    ok = "PASS" if diff < 1e-2 else ("WEAK" if diff < 5e-2 else "FAIL")
+                    m = compare_metrics(test.float(), ref.float())
+                    ok = verdict(m)
                 except Exception as e:
-                    diff = float("inf")
+                    m = compare_metrics(torch.tensor([float("nan")]),
+                                        torch.tensor([float("nan")]))
                     ok = f"ERR: {type(e).__name__}"
                 results.append({
                     "gate_up": gate_up,
                     "gate_first": gate_first,
                     "M": M,
-                    "diff": diff,
+                    "rank": rank,
+                    "calc_diff": m["calc_diff"],
+                    "alpha": m["alpha"],
+                    "norm_ratio": m["norm_ratio"],
+                    "rel_l2": m["rel_l2"],
                     "verdict": ok,
                 })
     return {"results": results}
@@ -501,11 +585,15 @@ def mode2_two_gemm(expert_id: int = 0, M_values: tuple = (8, 64)) -> dict:
 
 def print_mode2_results(out: dict, top_n: int = 24):
     rs = out["results"]
-    rs.sort(key=lambda r: r["diff"])
-    print(f"{'gate_up':>22} {'gate_first':>11} {'M':>4} {'diff':>10} verdict")
+    rs.sort(key=lambda r: (abs(r["alpha"] - 1.0) if r["alpha"] == r["alpha"]
+                           else 99, r["calc_diff"]))
+    print(f"{'gate_up':>22} {'gate_first':>11} {'rk':>2} {'M':>4} "
+          f"{'cd':>9} {'α':>7} {'norm':>6} {'L2':>6} verdict")
     for r in rs[:top_n]:
         print(f"{r['gate_up']:>22} {str(r['gate_first']):>11} "
-              f"{r['M']:>4} {r['diff']:>10.3e} {r['verdict']}")
+              f"{r['rank']:>2} {r['M']:>4} "
+              f"{r['calc_diff']:>9.2e} {r['alpha']:>7.3f} "
+              f"{r['norm_ratio']:>6.3f} {r['rel_l2']:>6.3f} {r['verdict']}")
 
 
 # ---------------------------------------------------------------------------
@@ -556,18 +644,24 @@ def deepgemm_masked_single_expert(
     return out[0].contiguous()
 
 
-def mode25_masked_vs_contiguous(expert_id: int = 0, M_values: tuple = (8, 64)) -> dict:
+def mode25_masked_vs_contiguous(expert_id: int = 0, M_values: tuple = (8, 64),
+                                  rank: int = 0) -> dict:
     """Compare contiguous-grouped GEMM vs masked-grouped GEMM on the
     SAME single-expert input. They MUST agree (same kernel family,
     different layout); if they don't, the masked path has a contract
-    mismatch in our integration."""
+    mismatch in our integration. Rank-aware to match live shapes."""
     weights = _load_expert_weights(expert_id)
     device = "cuda:0"
     torch.manual_seed(0xD4D4D4)
+    rank_w = _rank_shard_components(weights, rank=rank, tp=2)
+    w13_w_canon, w13_s_canon = build_w13(rank_w, "gate_first_half")
 
     results = []
-    for role, w, s, K in [("w2", weights["w2_w"], weights["w2_s"], INTERMEDIATE),
-                          ("w13_canonical", *build_w13(weights, "gate_first_half"), HIDDEN)]:
+    # Per-rank K is HIDDEN for w13 (column-parallel, K=hidden full) and
+    # INTERMEDIATE//2 for w2 (row-parallel, K=intermediate_per_rank).
+    for role, w, s, K in [("w2", rank_w["w2_w"], rank_w["w2_s"],
+                           INTERMEDIATE // 2),
+                          ("w13_canonical", w13_w_canon, w13_s_canon, HIDDEN)]:
         for M in M_values:
             a = (
                 torch.randn(M, K, dtype=torch.bfloat16, device=device) * 0.5
@@ -576,12 +670,19 @@ def mode25_masked_vs_contiguous(expert_id: int = 0, M_values: tuple = (8, 64)) -
             try:
                 out_contig = deepgemm_single_gemm(w, s, a)        # contiguous
                 out_masked = deepgemm_masked_single_expert(w, s, a)
-                diff = calc_diff(out_contig.float(), out_masked.float())
-                ok = "PASS" if diff < 1e-3 else ("WEAK" if diff < 1e-2 else "FAIL")
+                m = compare_metrics(out_masked.float(), out_contig.float())
+                ok = verdict(m, calc_diff_max=1e-3, alpha_tol=0.01,
+                             rel_l2_max=0.02)
             except Exception as e:
-                diff = float("inf")
+                m = compare_metrics(torch.tensor([float("nan")]),
+                                    torch.tensor([float("nan")]))
                 ok = f"ERR: {type(e).__name__}: {e}"[:80]
-            results.append({"role": role, "M": M, "diff": diff, "verdict": ok})
+            results.append({
+                "role": role, "M": M,
+                "calc_diff": m["calc_diff"], "alpha": m["alpha"],
+                "norm_ratio": m["norm_ratio"], "rel_l2": m["rel_l2"],
+                "verdict": ok,
+            })
     return {"results": results}
 
 
@@ -589,26 +690,107 @@ def mode25_masked_vs_contiguous(expert_id: int = 0, M_values: tuple = (8, 64)) -
 # Mode 1 driver.
 # ---------------------------------------------------------------------------
 
-def mode1_single_gemm(role: str, expert_id: int = 0, M_values: tuple = (8, 64)) -> dict:
-    """Sweep the layout matrix for one role on one expert."""
+def _rank_shard_components(weights: dict, rank: int = 0, tp: int = 2) -> dict:
+    """Slice raw w1/w3/w2 components to the per-rank intermediate range
+    BEFORE applying any gate/up convention. This is the only correct
+    way to model TP=2 column-parallel w13 + row-parallel w2 in the
+    oracle: building the convention first and then row-slicing breaks
+    interleaved/AITER/FlashInfer layouts.
+    """
+    assert INTERMEDIATE % tp == 0, (
+        f"INTERMEDIATE={INTERMEDIATE} not divisible by tp={tp}"
+    )
+    per = INTERMEDIATE // tp
+    s = rank * per
+    e = s + per
+    assert per % GRAN_K == 0, "per-rank intermediate not divisible by GRAN_K"
+    return {
+        "w1_w": weights["w1_w"][s:e].contiguous(),
+        "w1_s": weights["w1_s"][s:e].contiguous(),
+        "w3_w": weights["w3_w"][s:e].contiguous(),
+        "w3_s": weights["w3_s"][s:e].contiguous(),
+        # w2 is row-parallel: slice along K (column axis of packed nibbles
+        # and scales). Packed nibbles have K_packed = K // 2; scale K is
+        # K // GRAN_K.
+        "w2_w": weights["w2_w"][:, s // 2 : e // 2].contiguous(),
+        "w2_s": weights["w2_s"][:, s // GRAN_K : e // GRAN_K].contiguous(),
+    }
+
+
+def _shard_w13_for_rank(w_uint8: torch.Tensor, s_uint8: torch.Tensor,
+                         rank: int = 0, tp: int = 2):
+    """TP=2 column-parallel slice of w13/w13_scale to per-rank intermediate.
+
+    Live `Mxfp4MoEMethod.create_weights` stores per-rank `[2*intermediate_local,
+    hidden//2]`. The checkpoint stores GLOBAL `w1` and `w3` separately at
+    `[intermediate_global, hidden//2]`. To match what the live deepgemm runner
+    sees, we must slice each (w1, w3) to the rank's intermediate range and
+    concatenate. The ORACLE's Mode 1/2 currently uses full-global concat —
+    this is the rank-sharded variant.
+    """
+    int_global = w_uint8.shape[0] // 2  # w13 = [w1; w3], so global intermediate = N/2
+    per = int_global // tp
+    s_idx = rank * per
+    e_idx = s_idx + per
+    # gate (w1) = rows [0:int_global]; up (w3) = rows [int_global:2*int_global]
+    gate_w = w_uint8[s_idx:e_idx, :]
+    up_w = w_uint8[int_global + s_idx : int_global + e_idx, :]
+    gate_s = s_uint8[s_idx:e_idx, :]
+    up_s = s_uint8[int_global + s_idx : int_global + e_idx, :]
+    return torch.cat([gate_w, up_w], dim=0), torch.cat([gate_s, up_s], dim=0)
+
+
+def _shard_w2_for_rank(w_uint8: torch.Tensor, s_uint8: torch.Tensor,
+                        rank: int = 0, tp: int = 2):
+    """TP=2 row-parallel slice of w2/w2_scale to per-rank intermediate (K)."""
+    # w2 packed shape: [hidden, intermediate_packed_global]
+    # K (intermediate) split: each rank takes [s:e] columns of packed weight
+    # and corresponding scale columns.
+    assert w_uint8.shape[1] % tp == 0, (
+        f"w2 packed K dim {w_uint8.shape[1]} not divisible by tp={tp}"
+    )
+    assert s_uint8.shape[1] % tp == 0, (
+        f"w2 scale K dim {s_uint8.shape[1]} not divisible by tp={tp}"
+    )
+    int_global_packed = w_uint8.shape[1]
+    per_packed = int_global_packed // tp
+    s_packed = rank * per_packed
+    e_packed = s_packed + per_packed
+    # scale's K dim is K/gran_k = (2*int_global_packed)/32 = int_global_packed/16
+    int_global_scale = s_uint8.shape[1]
+    per_scale = int_global_scale // tp
+    s_scale = rank * per_scale
+    e_scale = s_scale + per_scale
+    # `.contiguous()` is mandatory: deepgemm asserts the B operand has
+    # `stride(0) == size(-2)*size(-1)` (utils/layout.hpp:17). A naked
+    # column slice is a view with the wrong strides.
+    return (w_uint8[:, s_packed:e_packed].contiguous(),
+            s_uint8[:, s_scale:e_scale].contiguous())
+
+
+def mode1_single_gemm(role: str, expert_id: int = 0, M_values: tuple = (8, 64),
+                       rank: int = 0) -> dict:
+    """Sweep the layout matrix for one role on one expert. `rank` enables
+    TP=2 per-rank weight slicing to match live shapes."""
     weights = _load_expert_weights(expert_id)
     device = "cuda:0"
 
     # Build deterministic non-uniform activations: sign + magnitude variation,
     # multiple M values. (Mode 1 acceptance: must rule out uniform-only artifacts.)
+    # K matches the rank-sharded weight: w13 column-parallel (K=hidden full),
+    # w2 row-parallel (K=intermediate_per_rank).
+    K = HIDDEN if role == "w13" else (INTERMEDIATE // 2)
     torch.manual_seed(0xD4D4D4)
     a_list = []
-    K = HIDDEN if role == "w13" else INTERMEDIATE
     for M in M_values:
         a = torch.randn(M, K, dtype=torch.bfloat16, device=device) * 0.5
         a += 0.1 * torch.linspace(-1, 1, M, device=device).unsqueeze(1).bfloat16()
         a_list.append(a)
 
+    rank_w = _rank_shard_components(weights, rank=rank, tp=2)
     if role == "w2":
-        # w2 has no gate/up axis; only nibble × K/N × scale × dtype.
         gate_up_set = ("N/A",)
-        canonical_w = weights["w2_w"]
-        canonical_s = weights["w2_s"]
+        canonical_w, canonical_s = rank_w["w2_w"], rank_w["w2_s"]
     elif role == "w13":
         gate_up_set = GATE_UP_CONVENTIONS
         canonical_w = canonical_s = None  # built per gate_up
@@ -618,7 +800,9 @@ def mode1_single_gemm(role: str, expert_id: int = 0, M_values: tuple = (8, 64)) 
     results = []
     for gate_up in gate_up_set:
         if role == "w13":
-            w_base, s_base = build_w13(weights, gate_up)
+            # Build the gate/up convention on already-rank-sharded w1/w3.
+            # This is the only valid order for non-half-concat layouts.
+            w_base, s_base = build_w13(rank_w, gate_up)
         else:
             w_base, s_base = canonical_w, canonical_s
 
@@ -646,53 +830,73 @@ def mode1_single_gemm(role: str, expert_id: int = 0, M_values: tuple = (8, 64)) 
                                     scale_contract=scale_c,
                                     packedfp4_view=view,
                                 )
-                                diff = calc_diff(test.float(), ref.float())
-                                ok = "PASS" if diff < 1e-2 else ("WEAK" if diff < 5e-2 else "FAIL")
+                                m = compare_metrics(test.float(), ref.float())
+                                v = verdict(m)
                             except Exception as e:
-                                diff = float("inf")
-                                ok = f"ERR: {type(e).__name__}"
+                                m = {"calc_diff": float("inf"), "alpha": float("nan"),
+                                     "norm_ratio": float("nan"), "rel_l2": float("nan"),
+                                     "abs_max": float("nan"), "abs_mean": float("nan")}
+                                v = f"ERR: {type(e).__name__}"
                             results.append({
                                 "role": role, "gate_up": gate_up, "nibble": nibble,
                                 "orient": orient, "scale_contract": scale_c,
-                                "view": view, "M": M, "diff": diff, "verdict": ok,
+                                "view": view, "M": M, "rank": rank,
+                                "calc_diff": m["calc_diff"], "alpha": m["alpha"],
+                                "norm_ratio": m["norm_ratio"], "rel_l2": m["rel_l2"],
+                                "verdict": v,
                             })
     return {"results": results}
 
 
 def print_results(out: dict, top_n: int = 20):
     rs = out["results"]
-    rs.sort(key=lambda r: r["diff"])
-    print(f"{'role':>4} {'gate_up':>20} {'nibble':>14} {'orient':>9} "
-          f"{'scale':>16} {'view':>20} {'M':>4} {'diff':>10} verdict")
+    rs.sort(key=lambda r: (abs(r["alpha"] - 1.0) if r["alpha"] == r["alpha"] else 99,
+                           r["calc_diff"]))
+    print(f"{'role':>4} {'rk':>2} {'gate_up':>20} {'nibble':>14} "
+          f"{'scale':>16} {'view':>20} {'M':>4} "
+          f"{'cd':>9} {'α':>7} {'norm':>6} {'L2':>6} verdict")
     for r in rs[:top_n]:
-        print(f"{r['role']:>4} {r['gate_up']:>20} {r['nibble']:>14} "
-              f"{r['orient']:>9} {r['scale_contract']:>16} {r['view']:>20} "
-              f"{r['M']:>4} {r['diff']:>10.3e} {r['verdict']}")
+        print(f"{r['role']:>4} {r['rank']:>2} {r['gate_up']:>20} "
+              f"{r['nibble']:>14} {r['scale_contract']:>16} {r['view']:>20} "
+              f"{r['M']:>4} "
+              f"{r['calc_diff']:>9.2e} {r['alpha']:>7.3f} "
+              f"{r['norm_ratio']:>6.3f} {r['rel_l2']:>6.3f} {r['verdict']}")
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", default="1")
     p.add_argument("--role", default="w2", choices=("w13", "w2"))
-    p.add_argument("--expert", type=int, default=0)
+    # Default to a known live-active expert from the D4.7.5 dump; expert 0
+    # is not in V4-Flash's decoded routing for the smoke prompt.
+    p.add_argument("--expert", type=int, default=254)
+    p.add_argument("--rank", type=int, default=0, help="TP=2 rank to slice weights for")
     args = p.parse_args()
 
     if args.mode == "1":
-        out = mode1_single_gemm(args.role, expert_id=args.expert)
+        out = mode1_single_gemm(args.role, expert_id=args.expert, rank=args.rank)
         print_results(out, top_n=30)
         passing = [r for r in out["results"] if r["verdict"] == "PASS"]
-        print(f"\n{len(passing)}/{len(out['results'])} cases passed (diff < 1e-2)")
+        mag_errs = [r for r in out["results"] if r["verdict"].startswith("MAG_ERR")]
+        print(f"\n{len(passing)}/{len(out['results'])} cases PASS")
+        print(f"{len(mag_errs)} cases MAG_ERR (cosine OK but magnitude wrong)")
         return 0 if passing else 1
     elif args.mode == "2":
-        out = mode2_two_gemm(expert_id=args.expert)
+        out = mode2_two_gemm(expert_id=args.expert, rank=args.rank)
         print_mode2_results(out, top_n=24)
         passing = [r for r in out["results"] if r["verdict"] == "PASS"]
-        print(f"\n{len(passing)}/{len(out['results'])} cases passed (diff < 1e-2)")
+        mag_errs = [r for r in out["results"]
+                    if r["verdict"].startswith("MAG_ERR")]
+        print(f"\n{len(passing)}/{len(out['results'])} cases PASS")
+        print(f"{len(mag_errs)} cases MAG_ERR (cosine OK, magnitude wrong)")
         return 0 if passing else 1
     elif args.mode == "2.5":
-        out = mode25_masked_vs_contiguous(expert_id=args.expert)
+        out = mode25_masked_vs_contiguous(expert_id=args.expert,
+                                           rank=args.rank)
         for r in out["results"]:
-            print(f"  {r['role']:>14} M={r['M']:>3}  diff={r['diff']:.3e}  {r['verdict']}")
+            print(f"  {r['role']:>14} M={r['M']:>3}  "
+                  f"cd={r['calc_diff']:.2e}  α={r['alpha']:.3f}  "
+                  f"L2={r['rel_l2']:.3f}  {r['verdict']}")
         bad = [r for r in out["results"] if r["verdict"] != "PASS"]
         return 1 if bad else 0
     else:

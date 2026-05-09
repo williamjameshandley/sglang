@@ -1098,19 +1098,37 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 # Limit weight dump to first expert × first ~100 rows to keep
                 # file size sane while still letting the oracle verify byte
                 # interpretation against checkpoint dequant.
-                w13_e0_slice = layer.w13_weight_dg[0, :, :].detach().cpu()
-                w13_s_e0_slice = layer.w13_scale_dg[0, :, :].detach().cpu() if layer.w13_scale_dg.dim() == 3 else layer.w13_scale_dg[0:1].detach().cpu()
-                w2_e0_slice = layer.w2_weight_dg[0, :, :].detach().cpu()
+                # Capture only the experts actually routed in this forward.
+                # Expert 0 is generally NOT in V4-Flash's decoded routing for
+                # the smoke prompt; dumping it gives the oracle nothing
+                # actionable. `topk_ids` is global; we slice w*_dg by global
+                # ID since the live runner's weight tensors are already the
+                # rank-local shard (so global ID == local index here for the
+                # fraction of experts that landed on this rank — preprocess
+                # masks others to masked_m=0).
+                active = torch.unique(topk_ids).to(torch.long)
+                active = active[active >= 0]
+                # Clamp to the local expert range to avoid index-out-of-range
+                # when the live preprocess routes some IDs to other ranks.
+                E_local = layer.w13_weight_dg.shape[0]
+                active = active[active < E_local]
+                w13_active = layer.w13_weight_dg[active].detach().cpu()
+                w13_s_active = layer.w13_scale_dg[active].detach().cpu()
+                w2_active = layer.w2_weight_dg[active].detach().cpu()
+                w2_s_active = layer.w2_scale_dg[active].detach().cpu()
                 torch.save({
                     "hidden_states": x.detach().cpu(),
                     "topk_weights": topk_weights.detach().cpu(),
                     "topk_ids": topk_ids.detach().cpu(),
                     "router_logits": router_logits.detach().cpu()
                                      if router_logits is not None else None,
-                    # Live loaded weights for expert 0 (rank-0 sharded).
-                    "w13_e0_loaded": w13_e0_slice,
-                    "w13_e0_scale_loaded": w13_s_e0_slice,
-                    "w2_e0_loaded": w2_e0_slice,
+                    # Live loaded weights for experts actually routed in this
+                    # forward (rank-local indices, sliced from layer.w*_dg).
+                    "active_experts": active.detach().cpu(),
+                    "w13_weight_dg_active": w13_active,
+                    "w13_scale_dg_active": w13_s_active,
+                    "w2_weight_dg_active": w2_active,
+                    "w2_scale_dg_active": w2_s_active,
                     "topk_ids_min": int(topk_ids.min()),
                     "topk_ids_max": int(topk_ids.max()),
                     "topk_ids_unique": int(topk_ids.unique().numel()),

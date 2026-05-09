@@ -4,15 +4,18 @@ expected B-operand layout for `m_grouped_fp8_fp4_gemm_nt_contiguous`.
 V4-Flash checkpoint loads MXFP4 weights as `torch.uint8` (packed
 nibbles, 2 elements per byte) with companion `torch.uint8` UE8M0
 scale tensors. Deepgemm's grouped FP8×FP4 GEMM expects the B operand
-as a tuple `(packed_nibbles_int8, scales_fp32)` with shapes:
+as a tuple `(packed_nibbles_int8, scales_packed_int32)` with shapes:
 
-- packed_nibbles_int8: `[num_groups, n, k // 2]` int8, K-major.
-- scales_fp32:        `[num_groups, n, ceil_div(k, gran_k)]` fp32.
+- packed_nibbles_int8:  `[num_groups, n, k // 2]` int8, K-major
+                        (uint8 byte-reinterpreted as int8).
+- scales_packed_int32:  packed INT32 UE8M0/TMA-aligned layout
+                        produced by `transform_sf_into_required_layout`.
 
 The scale tensor is decoded from UE8M0 bytes via
-`scale_fp32 = 2.0**(byte - 127.0)`. Deepgemm internally re-packs
-to INT32 UE8M0 via `transform_sf_into_required_layout` when
-`disable_ue8m0_cast=False`, so the helper does NOT need to pre-pack.
+`scale_fp32 = 2.0**(byte - 127.0)` and then pre-packed via
+`transform_sf_into_required_layout(..., recipe=(1, gran_k))`. The
+helper returns the already-packed INT32 layout so the caller does
+NOT pass FP32 scales to the deepgemm kernel.
 
 Two roles are handled separately because their shapes differ:
 
@@ -52,8 +55,10 @@ def _prepare_deepgemm_mxfp4_weight(
         weight_int8: deepgemm-compatible packed FP4 nibbles, dtype
             `torch.int8`, same shape as `raw_weight` (uint8 reinterpreted
             as int8 — same bytes, just typed for the deepgemm contract).
-        scales_fp32: decoded scales `2.0**(byte - 127.0)`, dtype
-            `torch.float32`, same shape as `raw_scale`.
+        scales_packed: INT32 packed UE8M0 layout returned by
+            `transform_sf_into_required_layout(..., recipe=(1, gran_k))`,
+            ready to pass directly to the deepgemm grouped FP8×FP4 GEMM.
+            (NOT the raw FP32 decoded scales — the helper pre-packs.)
     """
     assert raw_weight.dtype == torch.uint8, (
         f"expected uint8 weight, got {raw_weight.dtype}"

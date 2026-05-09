@@ -50,6 +50,54 @@ if not (_is_npu or _is_hip) and _is_cuda:
 
 
 _MASKED_GEMM_FAST_ACT = get_bool_env_var("SGLANG_MASKED_GEMM_FAST_ACT")
+
+
+# D4.7.5b — one-shot staged dump of intermediate tensors on the masked
+# deepgemm MoE path, used to bisect where the live 1.94× per-rank
+# magnitude error first appears. Activated by SGLANG_OPT_DUMP_DEEPGEMM_MOE
+# (the same env var that gates Mxfp4MoEMethod's input/output dump). Each
+# stage appends to a single dict and writes it once at the end of
+# post_permute_deep_gemm_to_standard.
+_DG_STAGE_DUMP_DONE = False
+_DG_STAGE_DUMP: dict | None = None
+
+
+def _dg_stage_dump_active() -> bool:
+    """True only for the FIRST forward through the masked deepgemm MoE
+    path on this process when the env var is set."""
+    global _DG_STAGE_DUMP, _DG_STAGE_DUMP_DONE
+    if _DG_STAGE_DUMP_DONE:
+        return False
+    from sglang.srt import environ as _env
+    if not _env.SGLANG_OPT_DUMP_DEEPGEMM_MOE.get():
+        return False
+    if _DG_STAGE_DUMP is None:
+        _DG_STAGE_DUMP = {}
+    return True
+
+
+def _dg_stage_dump_record(stage: str, payload: dict) -> None:
+    """Record (small) tensors / scalars at a named stage. Active experts
+    are sliced out by the caller; full E×M_pad×* tensors must NOT be
+    saved or the file blows up."""
+    if not _dg_stage_dump_active():
+        return
+    _DG_STAGE_DUMP[stage] = payload
+
+
+def _dg_stage_dump_finalise() -> None:
+    """Persist the accumulated stage dump and mark the one-shot flag."""
+    global _DG_STAGE_DUMP_DONE, _DG_STAGE_DUMP
+    if _DG_STAGE_DUMP is None or _DG_STAGE_DUMP_DONE:
+        return
+    import os as _os
+    import sys as _sys
+    path = f"/tmp/deepgemm_stages_{_os.getpid()}.pt"
+    torch.save(_DG_STAGE_DUMP, path)
+    print(f"[D4.7.5b] dumped staged deepgemm tensors to {path}",
+          file=_sys.stderr, flush=True)
+    _DG_STAGE_DUMP_DONE = True
+    _DG_STAGE_DUMP = None
 _DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 
 
@@ -316,6 +364,27 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 masked_m,
                 expected_m,
             )
+        if _dg_stage_dump_active():
+            active_dev = torch.nonzero(masked_m > 0).flatten()
+            active_cpu = active_dev.detach().cpu()
+            running_state["_dg_active_experts"] = active_dev
+            _dg_stage_dump_record("post_gemm1", {
+                "active_experts": active_cpu,
+                "masked_m": masked_m.detach().cpu(),
+                "expected_m": int(expected_m) if isinstance(expected_m, int)
+                              else expected_m,
+                "num_groups": num_groups,
+                "m_pad": m,
+                "n_w13": gateup_output.shape[-1],
+                "hidden_states_active": hidden_states[active_dev].detach().cpu(),
+                "hidden_states_scale_active":
+                    hidden_states_scale[active_dev].detach().cpu(),
+                "hidden_states_scale_dtype": str(hidden_states_scale.dtype),
+                "hidden_states_scale_shape": tuple(hidden_states_scale.shape),
+                "hidden_states_scale_stride": tuple(hidden_states_scale.stride()),
+                "gateup_output_active": gateup_output[active_dev].detach().cpu(),
+            })
+
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
 
@@ -360,6 +429,18 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 masked_m,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
+        if _dg_stage_dump_active():
+            active_dev = running_state["_dg_active_experts"]
+            _dg_stage_dump_record("post_activation", {
+                "_MASKED_GEMM_FAST_ACT": _MASKED_GEMM_FAST_ACT,
+                "scale_ue8m0_env": deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                "down_input_active": down_input[active_dev].detach().cpu(),
+                "down_input_scale_active":
+                    down_input_scale[active_dev].detach().cpu(),
+                "down_input_scale_dtype": str(down_input_scale.dtype),
+                "down_input_scale_shape": tuple(down_input_scale.shape),
+                "down_input_scale_stride": tuple(down_input_scale.stride()),
+            })
         del gateup_output
 
         # GroupGemm-1
@@ -369,10 +450,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # silu_and_mul_masked_post_quant_fwd writes a FP32 power-of-two scale
         # (with `scale_ue8m0=True` it just rounds the float; it does NOT pack
         # to int UE8M0). DeepGEMM's masked FP8×FP4/FP8 expects packed UE8M0
-        # when DEEPGEMM_SCALE_UE8M0 is set, exactly like the GEMM-1 path. The
-        # missing cast was producing coherent-but-2×-magnitude output on the
-        # V4-Flash MXFP4 deepgemm path (D4.7.5 live replay calc_diff 1.45e-4
-        # with α=1.94×).
+        # when DEEPGEMM_SCALE_UE8M0 is set, exactly like the GEMM-1 path —
+        # so this preprocessing must be symmetric with GEMM 1. (The live
+        # 1.94× per-rank magnitude error on the V4-Flash MXFP4 deepgemm
+        # path persisted after this conversion was added, so this cast is
+        # necessary for symmetry but is not the root cause of that bug.)
         if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
             if down_input_scale.dtype != torch.int:
                 b, s_mn, s_k = down_input_scale.shape
@@ -386,6 +468,16 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
             )
+
+        if _dg_stage_dump_active():
+            active_dev = running_state["_dg_active_experts"]
+            _dg_stage_dump_record("pre_gemm2", {
+                "down_input_scale_active":
+                    down_input_scale[active_dev].detach().cpu(),
+                "down_input_scale_dtype": str(down_input_scale.dtype),
+                "down_input_scale_shape": tuple(down_input_scale.shape),
+                "down_input_scale_stride": tuple(down_input_scale.stride()),
+            })
 
         down_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
@@ -430,6 +522,13 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             block_m, threshold = deep_gemm_return_value
             meta_overlap_args["block_m"] = block_m
             meta_overlap_args["threshold"] = threshold
+
+        if _dg_stage_dump_active():
+            active_dev = running_state["_dg_active_experts"]
+            _dg_stage_dump_record("post_gemm2", {
+                "n_w2": down_output.shape[-1],
+                "down_output_active": down_output[active_dev].detach().cpu(),
+            })
 
         return down_output
 
@@ -506,6 +605,25 @@ def post_permute_deep_gemm_to_standard(
     topk_ids = running_state["topk_ids"]
     topk_weights = running_state["topk_weights"]
 
+    if _dg_stage_dump_active():
+        active_dev = running_state.get("_dg_active_experts", None)
+        if active_dev is not None and runner_output.hidden_states.dim() == 3:
+            ro_active = runner_output.hidden_states[active_dev].detach().cpu()
+        else:
+            # 2-D runner output (already-flattened) — fall back to full
+            # tensor; this only fires for non-masked path which is not
+            # the live target.
+            ro_active = runner_output.hidden_states.detach().cpu()
+        _dg_stage_dump_record("pre_post_reorder", {
+            "src2dst": src2dst.detach().cpu(),
+            "topk_ids": topk_ids.detach().cpu(),
+            "topk_weights": topk_weights.detach().cpu(),
+            "runner_output_active": ro_active,
+            "top_k": runner_config.top_k,
+            "routed_scaling_factor": runner_config.routed_scaling_factor,
+            "hidden_states_shape": tuple(hidden_states_shape),
+        })
+
     output = torch.empty(
         hidden_states_shape, dtype=hidden_states_dtype, device=hidden_states_device
     )
@@ -520,10 +638,21 @@ def post_permute_deep_gemm_to_standard(
         BLOCK_SIZE=512,
     )
 
+    if _dg_stage_dump_active():
+        _dg_stage_dump_record("post_reorder_before_rsf", {
+            "output": output.detach().cpu(),
+        })
+
     dispose_tensor(runner_output.hidden_states)
 
     if runner_config.routed_scaling_factor is not None:
         output *= runner_config.routed_scaling_factor
+
+    if _dg_stage_dump_active():
+        _dg_stage_dump_record("post_reorder_after_rsf", {
+            "output": output.detach().cpu(),
+        })
+        _dg_stage_dump_finalise()
 
     return StandardCombineInput(
         hidden_states=output,
