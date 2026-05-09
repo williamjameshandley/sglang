@@ -1095,12 +1095,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 Mxfp4MoEMethod._dump_done = True
                 topk_weights, topk_ids, router_logits = topk_output
                 dump_path = f"/tmp/deepgemm_dump_{os.getpid()}.pt"
+                # Limit weight dump to first expert × first ~100 rows to keep
+                # file size sane while still letting the oracle verify byte
+                # interpretation against checkpoint dequant.
+                w13_e0_slice = layer.w13_weight_dg[0, :, :].detach().cpu()
+                w13_s_e0_slice = layer.w13_scale_dg[0, :, :].detach().cpu() if layer.w13_scale_dg.dim() == 3 else layer.w13_scale_dg[0:1].detach().cpu()
+                w2_e0_slice = layer.w2_weight_dg[0, :, :].detach().cpu()
                 torch.save({
                     "hidden_states": x.detach().cpu(),
                     "topk_weights": topk_weights.detach().cpu(),
                     "topk_ids": topk_ids.detach().cpu(),
                     "router_logits": router_logits.detach().cpu()
                                      if router_logits is not None else None,
+                    # Live loaded weights for expert 0 (rank-0 sharded).
+                    "w13_e0_loaded": w13_e0_slice,
+                    "w13_e0_scale_loaded": w13_s_e0_slice,
+                    "w2_e0_loaded": w2_e0_slice,
                     "topk_ids_min": int(topk_ids.min()),
                     "topk_ids_max": int(topk_ids.max()),
                     "topk_ids_unique": int(topk_ids.unique().numel()),
