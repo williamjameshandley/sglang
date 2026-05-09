@@ -365,7 +365,24 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         # GroupGemm-1
         n = w2_weight.shape[1]
 
-        if deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
+        # Mirror GEMM 1's hidden_states_scale preprocessing (line 281-293).
+        # silu_and_mul_masked_post_quant_fwd writes a FP32 power-of-two scale
+        # (with `scale_ue8m0=True` it just rounds the float; it does NOT pack
+        # to int UE8M0). DeepGEMM's masked FP8×FP4/FP8 expects packed UE8M0
+        # when DEEPGEMM_SCALE_UE8M0 is set, exactly like the GEMM-1 path. The
+        # missing cast was producing coherent-but-2×-magnitude output on the
+        # V4-Flash MXFP4 deepgemm path (D4.7.5 live replay calc_diff 1.45e-4
+        # with α=1.94×).
+        if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+            if down_input_scale.dtype != torch.int:
+                b, s_mn, s_k = down_input_scale.shape
+                assert (
+                    s_mn % 4 == 0 and s_k % 4 == 0
+                ), f"scales must be aligned to 4, but got ({b}, {s_mn}, {s_k})"
+                down_input_scale = _cast_to_e8m0_with_rounding_up(
+                    down_input_scale
+                )
+        elif deep_gemm_wrapper.DEEPGEMM_NEED_TMA_ALIGNED_SCALES:
             down_input_scale = deep_gemm_wrapper.get_mn_major_tma_aligned_tensor(
                 down_input_scale
             )
