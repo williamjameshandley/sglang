@@ -68,8 +68,8 @@ def _dg_stage_dump_active() -> bool:
     global _DG_STAGE_DUMP, _DG_STAGE_DUMP_DONE
     if _DG_STAGE_DUMP_DONE:
         return False
-    from sglang.srt import environ as _env
-    if not _env.SGLANG_OPT_DUMP_DEEPGEMM_MOE.get():
+    from sglang.srt.environ import envs
+    if not envs.SGLANG_OPT_DUMP_DEEPGEMM_MOE.get():
         return False
     if _DG_STAGE_DUMP is None:
         _DG_STAGE_DUMP = {}
