@@ -95,11 +95,20 @@ def _prepare_deepgemm_mxfp4_weight(
     # `torch.int8` for the packed FP4 weight tensor).
     weight_int8 = raw_weight.view(torch.int8)
 
-    # UE8M0 byte -> FP32 scale via 2^(byte - 127), then pre-pack to
-    # deepgemm's INT32 TMA-aligned layout. The packed output is ~1/4
-    # the FP32 size which matters at V4-Flash scales (~400MB → ~100MB
-    # per rank for the full E×N×K/32 scale tensor).
-    scales_fp32 = torch.pow(2.0, raw_scale.to(torch.float32) - 127.0)
+    # UE8M0 byte -> FP32 scale, then pre-pack to deepgemm's INT32
+    # TMA-aligned layout. The packed output is ~1/4 the FP32 size, which
+    # matters at V4-Flash scales (~400MB → ~100MB per rank for the full
+    # E×N×K/32 scale tensor).
+    #
+    # Scale-exponent convention: V4-Flash live OAI matmul_ogs (the
+    # known-good backend) interprets the down-projection MXFP4 scale
+    # one exponent lower than triton_kernels.numerics_details.mxfp.upcast_from_mxfp.
+    # Cross-backend layer-by-layer diff at layer 0 post_mlp showed
+    # alpha=DeepGEMM/Triton≈1.94 with cosine≈0.9998 — a clean scalar
+    # bias-by-1 error on w2 produces exactly this signature. Use bias 128
+    # for w2 to match OAI; w13 still uses 127.
+    scale_bias = 128.0 if role == "w2" else 127.0
+    scales_fp32 = torch.pow(2.0, raw_scale.to(torch.float32) - scale_bias)
     from deep_gemm import transform_sf_into_required_layout
     num_groups, n, _ = raw_weight.shape
     k = 2 * raw_weight.shape[2]  # nibbles → elements
