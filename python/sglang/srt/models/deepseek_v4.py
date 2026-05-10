@@ -1774,6 +1774,76 @@ class MQALayer(nn.Module):
         return o
 
 
+# D4.7.5c — layer-level hidden-state dump for backend bisection.
+# Dumps a small fingerprint (norm + mean + std + first-64-element slice +
+# checksum) at each layer entry/exit on the first forward only. Triggered
+# by SGLANG_OPT_DUMP_DEEPGEMM_LAYERS=1; one-shot — second visit to the
+# same layer_id flushes the accumulator and disables further dumps.
+_LAYER_DUMP_ACC: dict = {}
+_LAYER_DUMP_SEEN: set = set()
+_LAYER_DUMP_FLUSHED: bool = False
+
+
+def _layer_dump_active() -> bool:
+    global _LAYER_DUMP_FLUSHED
+    if _LAYER_DUMP_FLUSHED:
+        return False
+    return envs.SGLANG_OPT_DUMP_DEEPGEMM_LAYERS.get()
+
+
+def _layer_dump_record(layer_id: int, stage: str, tensor: torch.Tensor) -> None:
+    """Record a small fingerprint of `tensor` at this (layer, stage)."""
+    if not _layer_dump_active():
+        return
+    key = (int(layer_id), stage)
+    if key in _LAYER_DUMP_SEEN:
+        # Second visit — flush and stop.
+        _layer_dump_flush()
+        return
+    _LAYER_DUMP_SEEN.add(key)
+    t = tensor.detach()
+    t_f = t.float()
+    finite = torch.isfinite(t_f)
+    n = int(finite.sum().item())
+    if n == 0:
+        norm = float("nan")
+        mean = std = float("nan")
+        slice_head = t_f.flatten()[:64].cpu()
+        checksum = float("nan")
+    else:
+        tf = t_f[finite]
+        norm = float(tf.norm().item())
+        mean = float(tf.mean().item())
+        std = float(tf.std().item()) if tf.numel() > 1 else 0.0
+        slice_head = t_f.flatten()[:64].cpu()
+        # Sum-based checksum is order-stable enough for cross-backend diff.
+        checksum = float(tf.sum().item())
+    _LAYER_DUMP_ACC[key] = {
+        "shape": tuple(t.shape),
+        "dtype": str(t.dtype),
+        "n_finite": n,
+        "norm": norm,
+        "mean": mean,
+        "std": std,
+        "checksum": checksum,
+        "slice_head_64": slice_head,
+    }
+
+
+def _layer_dump_flush() -> None:
+    global _LAYER_DUMP_FLUSHED
+    if _LAYER_DUMP_FLUSHED:
+        return
+    import os as _os
+    import sys as _sys
+    path = f"/tmp/deepgemm_layers_{_os.getpid()}.pt"
+    torch.save(_LAYER_DUMP_ACC, path)
+    print(f"[D4.7.5c] dumped layer-level fingerprints to {path} "
+          f"({len(_LAYER_DUMP_ACC)} entries)",
+          file=_sys.stderr, flush=True)
+    _LAYER_DUMP_FLUSHED = True
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -2080,6 +2150,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
             pass
 
+        _layer_dump_record(self.layer_id, "entry", hidden_states)
         residual = hidden_states
         hidden_states, post, comb = self.hc_pre(
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
@@ -2093,11 +2164,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         )
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        _layer_dump_record(self.layer_id, "post_attn", hidden_states)
         residual = hidden_states  # [n, hc, d]
         hidden_states, post, comb = self.hc_pre(
             hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
         )  # -> [n, d]
         hidden_states = self.post_attention_layernorm(hidden_states)
+        _layer_dump_record(self.layer_id, "pre_mlp", hidden_states)
 
         # Communication logic (equivalent to LayerCommunicator):
         #
@@ -2155,6 +2228,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        _layer_dump_record(self.layer_id, "post_mlp", hidden_states)
         # ----------------------------------- Scatter (DP only, not CP) ----------------
         if _use_tp_moe_gather:
             hidden_states, global_hidden_states = get_local_dp_buffer(), hidden_states
@@ -2163,6 +2237,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states = self.hc_post(
             hidden_states, residual, post, comb
         )  # [n, d] -> [n, hc, d]
+        _layer_dump_record(self.layer_id, "exit", hidden_states)
 
         if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
             deepseek_v4_moe_code_path_checker.observed = 0

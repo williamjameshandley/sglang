@@ -572,6 +572,9 @@ class Envs:
     # D4.7.5 live tensor capture for the deepgemm MoE oracle. One-shot
     # per process; dumps to /tmp/deepgemm_dump_<pid>.pt.
     SGLANG_OPT_DUMP_DEEPGEMM_MOE = EnvBool(False)
+    # D4.7.5c — per-layer hidden-state fingerprint dump for cross-backend
+    # bisection (find first layer where deepgemm and triton_kernels diverge).
+    SGLANG_OPT_DUMP_DEEPGEMM_LAYERS = EnvBool(False)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")
     SGLANG_FLASHMLA_BACKEND = EnvStr(None)
     SGLANG_SPARSE_MLA_NUM_SPLITS = EnvInt(None)
