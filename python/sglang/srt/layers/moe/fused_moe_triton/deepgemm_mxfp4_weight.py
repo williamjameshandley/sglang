@@ -107,13 +107,11 @@ def _prepare_deepgemm_mxfp4_weight(
     # alpha=DeepGEMM/Triton≈1.94 with cosine≈0.9998 — a clean scalar
     # bias-by-1 error on w2 produces exactly this signature. Use bias 128
     # for w2 to match OAI; w13 still uses 127.
-    # Empirical fix: V4-Flash live OAI matmul_ogs interprets BOTH w13 and w2
-    # MXFP4 scales with exponent bias 128. (DeepGEMM/upcast_from_mxfp use 127.)
-    # Layer-0 layer-bisection vs triton_kernels showed the factor-of-2 was on
-    # w2 alone, but later layers retained α∈[0.81,1.15] residual — testing
-    # whether w13 also needs 128.
-    scale_bias = 128.0
-    scales_fp32 = torch.pow(2.0, raw_scale.to(torch.float32) - scale_bias)
+    # UE8M0 byte → FP32 scale via 2^(byte - 127). This is the convention
+    # `triton_kernels.numerics_details.mxfp.upcast_from_mxfp` uses for
+    # raw checkpoint MXFP4 weights. Pre-pack to deepgemm's INT32
+    # TMA-aligned layout. The packed output is ~1/4 the FP32 size.
+    scales_fp32 = torch.pow(2.0, raw_scale.to(torch.float32) - 127.0)
     from deep_gemm import transform_sf_into_required_layout
     num_groups, n, _ = raw_weight.shape
     k = 2 * raw_weight.shape[2]  # nibbles → elements
