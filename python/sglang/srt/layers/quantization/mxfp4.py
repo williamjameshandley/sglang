@@ -1182,6 +1182,19 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # the OAI triton_kernels branch below scales manually because it
             # bypasses MoeRunner.run; the deepgemm branch does not bypass it.
             combine_input = self.runner.run(dispatch_output, quant_info)
+            # D4.7.6 diagnostic: cross-backend layer diff at layer 0 post_mlp
+            # showed DeepGEMM output ≈ 2 × triton_kernels output (cos=0.9998)
+            # under TP=2. triton_kernels matmul_ogs apparently returns a
+            # half-partial that the surrounding all-reduce sums to "full",
+            # while the DeepGEMM masked path returns full per-rank,
+            # giving 2× full after all-reduce. Test by dividing by
+            # tp_world_size at the apply boundary; if smoke flips to "391",
+            # the integration boundary is the bug site (not the kernel,
+            # which we already verified matches BF16 math at α=1.0).
+            from sglang.srt.distributed import get_tp_group as _get_tp_group
+            _tp_ws = _get_tp_group().world_size
+            if _tp_ws > 1:
+                combine_input.hidden_states = combine_input.hidden_states / _tp_ws
             if _do_dump_output:
                 Mxfp4MoEMethod._dump_output_done = True
                 dump_path = f"/tmp/deepgemm_dumpout_{os.getpid()}.pt"
