@@ -1192,9 +1192,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # the integration boundary is the bug site (not the kernel,
             # which we already verified matches BF16 math at α=1.0).
             from sglang.srt.distributed import get_tp_group as _get_tp_group
+            from sglang.srt.layers.moe.token_dispatcher.standard import (
+                StandardCombineInput as _StandardCombineInput,
+            )
             _tp_ws = _get_tp_group().world_size
             if _tp_ws > 1:
-                combine_input.hidden_states = combine_input.hidden_states / _tp_ws
+                combine_input = _StandardCombineInput(
+                    hidden_states=combine_input.hidden_states / _tp_ws,
+                )
             if _do_dump_output:
                 Mxfp4MoEMethod._dump_output_done = True
                 dump_path = f"/tmp/deepgemm_dumpout_{os.getpid()}.pt"
