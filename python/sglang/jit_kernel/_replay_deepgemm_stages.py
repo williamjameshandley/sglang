@@ -81,10 +81,18 @@ def alpha_metrics(test: torch.Tensor, ref: torch.Tensor) -> dict:
 
 
 def bf16_dequant_w(w_uint8: torch.Tensor, s_uint8: torch.Tensor) -> torch.Tensor:
-    """Dequantize MXFP4 (uint8 packed nibbles + uint8 UE8M0 scales) to BF16."""
+    """Dequantize MXFP4 (uint8 packed nibbles + uint8 UE8M0 scales) to BF16.
+
+    `upcast_from_mxfp` is a Triton kernel and needs CUDA tensors. The
+    dumped checkpoint tensors are loaded to CPU; move to CUDA, then
+    bring the result back to CPU for the rest of the analysis (which
+    does plain torch matmuls in float32).
+    """
     from triton_kernels.numerics_details.mxfp import upcast_from_mxfp
-    return upcast_from_mxfp(w_uint8, s_uint8, target_dtype=torch.bfloat16,
-                             axis=-1)
+    w = w_uint8.cuda() if not w_uint8.is_cuda else w_uint8
+    s = s_uint8.cuda() if not s_uint8.is_cuda else s_uint8
+    out = upcast_from_mxfp(w, s, target_dtype=torch.bfloat16, axis=-1)
+    return out.cpu()
 
 
 def fp8_dequant(fp8_active: torch.Tensor, scale_active: torch.Tensor,
