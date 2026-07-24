@@ -1780,6 +1780,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         break
                     await asyncio.sleep(1.0)
 
+    async def memory_occupation_status(self):
+        internal_states = await self.get_internal_state()
+        return {
+            "generation_paused": self.is_pause,
+            "offload_tags": [state["offload_tags"] for state in internal_states],
+        }
+
     async def continue_generation(self, obj: ContinueGenerationReqInput):
         async with self.is_pause_cond:
             self.is_pause = False

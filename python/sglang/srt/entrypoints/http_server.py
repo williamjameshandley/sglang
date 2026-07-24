@@ -1632,6 +1632,12 @@ async def pause_generation(
     )
 
 
+@app.get("/memory_occupation_status")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def memory_occupation_status():
+    return await _global_state.tokenizer_manager.memory_occupation_status()
+
+
 @app.post("/continue_generation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def continue_generation(

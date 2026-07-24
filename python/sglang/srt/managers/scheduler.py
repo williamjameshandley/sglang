@@ -3904,6 +3904,7 @@ class Scheduler(
             "graph": round(self.tp_worker.model_runner.graph_mem_usage, 2),
         }
         ret["effective_max_running_requests_per_dp"] = self.max_running_requests
+        ret["offload_tags"] = sorted(self.weight_updater.offload_tags)
 
         if self.server_args.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
