@@ -49,6 +49,7 @@ class SchedulerInternalStateController:
         for contribute in (
             self._add_topology,
             self._add_memory_usage,
+            self._add_offload_tags,
             self._add_disaggregation,
             self._add_elastic_ep,
             self._add_speculative,
@@ -87,6 +88,10 @@ class SchedulerInternalStateController:
                 None if draft_worker is None else draft_worker.graph_memory_usage
             ),
         )
+
+    def _add_offload_tags(self, state: Dict[str, Any]) -> None:
+        # Memory regions this rank has released via /release_memory_occupation.
+        state["offload_tags"] = sorted(self.scheduler.weight_updater.offload_tags)
 
     def _add_disaggregation(self, state: Dict[str, Any]) -> None:
         # PD role switch: report this instance's role and the decode CUDA graph

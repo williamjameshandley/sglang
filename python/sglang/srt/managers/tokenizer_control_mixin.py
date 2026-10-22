@@ -883,6 +883,15 @@ class TokenizerControlMixin:
         self.auto_create_handle_loop()
         await self.resume_memory_occupation_communicator(obj)
 
+    async def memory_occupation_status(self: TokenizerManager) -> Dict[str, Any]:
+        """Whether generation is paused and which memory regions each rank
+        has released, so a controller can resume exactly what it released."""
+        internal_states = await self.get_internal_state()
+        return {
+            "generation_paused": self.is_pause,
+            "offload_tags": [state["offload_tags"] for state in internal_states],
+        }
+
     async def check_weights(
         self: TokenizerManager,
         obj: CheckWeightsReqInput,

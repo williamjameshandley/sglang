@@ -1561,6 +1561,13 @@ async def resume_memory_occupation(
         return _create_error_response(e)
 
 
+@app.get("/memory_occupation_status")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def memory_occupation_status():
+    """Report whether generation is paused and the memory regions each rank has released."""
+    return await _global_state.tokenizer_manager.memory_occupation_status()
+
+
 @app.api_route("/weights_checker", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def check_weights(
