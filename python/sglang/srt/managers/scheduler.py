@@ -2598,12 +2598,13 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
-        # Keep this bound consistent with PrefillAdder's admission budget.
+        # The final sampled token is returned without a KV slot, so a request
+        # may run to exactly max_req_len + 1 tokens in total.
         max_new_tokens = max(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                self.max_req_len - input_len + 1,
             ),
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.

@@ -18,7 +18,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
     """Property tests for Scheduler.init_req_max_new_tokens.
 
     Rules enforced when clipping a request's max_new_tokens:
-      1. context: input_len + max_new_tokens < max_req_len
+      1. context: input_len + max_new_tokens - 1 <= max_req_len; the final
+         sampled token is returned without being written to the KV cache
       2. admission budget (PrefillAdder):
          ceil_page(input_len) + max_new_tokens + page_size * shard_widening
          < max_total_num_tokens * shard_widening
@@ -97,7 +98,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         limit_active = limit is not None and limit > 0
 
         def satisfies_rules(candidate: int) -> bool:
-            context_ok = input_len + candidate < scheduler.max_req_len
+            context_ok = input_len + candidate - 1 <= scheduler.max_req_len
             budget_ok = (
                 paged_input_len + candidate + page_size * shard_widening
                 < scheduler.max_total_num_tokens * shard_widening
@@ -145,7 +146,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             scheduler = self._new_scheduler(max_req_len=max_req_len)
             req = self._new_req(max_new_tokens=64, input_len=input_len)
             self.assertEqual(
-                self._init_and_check(scheduler, req), max_req_len - input_len - 1
+                self._init_and_check(scheduler, req), max_req_len - input_len + 1
             )
 
     def test_budget_rule_binds_tighter_than_limit(self):
