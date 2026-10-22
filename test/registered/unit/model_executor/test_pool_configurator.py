@@ -74,6 +74,7 @@ def _make_model_runner(
     page_size=1,
     mambaish_config=None,
     disable_radix_cache=False,
+    enable_hierarchical_cache=False,
     chunked_prefill_size=None,
     disable_overlap_schedule=False,
     sliding_window_size=None,
@@ -158,7 +159,7 @@ def _make_model_runner(
         hisparse_config=(
             f'{{"host_to_device_ratio": {hisparse_host_to_device_ratio}}}'
         ),
-        enable_hierarchical_cache=False,
+        enable_hierarchical_cache=enable_hierarchical_cache,
         enable_dsa_cache_layer_split=False,
         kv_cache_dtype="auto",
     )
@@ -1179,14 +1180,21 @@ class TestFactory(CustomTestCase):
 
     def test_chunk_cap_configurator_selection(self):
         # SWARequestCapPoolConfigurator is selected only when max_running_requests is set.
-        def _cfg(max_running_requests, chunked_prefill_size=4):
+        def _cfg(
+            max_running_requests,
+            chunked_prefill_size=4,
+            *,
+            disable_radix_cache=True,
+            enable_hierarchical_cache=False,
+        ):
             mr = _make_model_runner(
                 self,
                 is_hybrid_swa=True,
                 full_attention_layer_ids=[0],
                 swa_attention_layer_ids=[1],
                 swa_num_kv_heads=4,
-                disable_radix_cache=True,
+                disable_radix_cache=disable_radix_cache,
+                enable_hierarchical_cache=enable_hierarchical_cache,
                 chunked_prefill_size=chunked_prefill_size,
                 sliding_window_size=8,
                 max_running_requests=max_running_requests,
@@ -1207,6 +1215,15 @@ class TestFactory(CustomTestCase):
         # Chunked prefill off: a whole prompt can exceed the cap.
         self.assertNotIsInstance(
             _cfg(2, chunked_prefill_size=-1), SWARequestCapPoolConfigurator
+        )
+        # Hierarchical caching sizes the SWA pool for active requests, as a
+        # disabled radix cache does; a plain radix cache keeps the ratio split.
+        self.assertIsInstance(
+            _cfg(2, disable_radix_cache=False, enable_hierarchical_cache=True),
+            SWARequestCapPoolConfigurator,
+        )
+        self.assertNotIsInstance(
+            _cfg(2, disable_radix_cache=False), SWARequestCapPoolConfigurator
         )
 
 

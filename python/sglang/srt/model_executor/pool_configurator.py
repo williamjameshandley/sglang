@@ -959,11 +959,12 @@ class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):
 
     @staticmethod
     def is_applicable(kvc: KVCacheConfigurator) -> bool:
-        """True when a radix-disabled hybrid SWA cache can be sized from
-        explicit max requests."""
+        """True when active SWA use can be sized from explicit max requests,
+        with the radix cache disabled or with hierarchical caching."""
         if get_schedule().max_running_requests is None:
             return False
-        if not get_memory().disable_radix_cache:
+        memory = get_memory()
+        if not (memory.disable_radix_cache or memory.enable_hierarchical_cache):
             return False
         # The cap holds at most one prefill chunk per batch in flight; an
         # unchunked prefill writes the whole prompt into the SWA pool.
