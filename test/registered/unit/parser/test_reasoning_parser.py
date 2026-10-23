@@ -759,6 +759,51 @@ class TestGemma4Detector(CustomTestCase):
         result3 = self.detector.parse_streaming_increment("reasoning here")
         self.assertEqual(result3.reasoning_text, "reasoning here")
 
+    def test_detect_and_parse_text_before_block(self):
+        """Content the model wrote before its first block stays content."""
+        text = "Not sure. <|channel>thought\nsearch first<channel|>Searching."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "search first")
+        self.assertEqual(result.normal_text, "Not sure. Searching.")
+
+    def test_detect_and_parse_two_blocks(self):
+        """A second block opened mid-answer is reasoning, not content."""
+        text = (
+            "<|channel>thought\nfirst<channel|>Part one. "
+            "<|channel>thought\nsecond<channel|>Part two."
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "firstsecond")
+        self.assertEqual(result.normal_text, "Part one. Part two.")
+
+    def test_streaming_second_block(self):
+        """A second block opened mid-answer is streamed as reasoning, markers stripped."""
+        reasoning, normal = "", ""
+        for chunk in (
+            "<|channel>thought\nfirst",
+            "<channel|>",
+            "Part one. ",
+            "<|channel>thought\nsecond",
+            "<channel|>",
+            "Part two.",
+        ):
+            result = self.detector.parse_streaming_increment(chunk)
+            reasoning += result.reasoning_text
+            normal += result.normal_text
+        self.assertEqual(reasoning, "firstsecond")
+        self.assertEqual(normal, "Part one. Part two.")
+
+    def test_streaming_text_and_block_in_one_chunk(self):
+        """Content before a block in the same chunk goes out first; the block follows."""
+        result = self.detector.parse_streaming_increment(
+            "Not sure. <|channel>thought\nsearch first<channel|>Searching."
+        )
+        self.assertEqual(result.normal_text, "Not sure. ")
+        self.assertEqual(result.reasoning_text, "")
+        result = self.detector.finish()
+        self.assertEqual(result.reasoning_text, "search first")
+        self.assertEqual(result.normal_text, "Searching.")
+
 
 class TestReasoningParser(CustomTestCase):
     def test_init_valid_model(self):
@@ -1158,23 +1203,11 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
                         self._feed(DeepSeekR1Detector(), text, chunk_size), expected
                     )
 
-    def test_text_before_think_token_is_chunk_dependent(self):
-        """Accepted divergence, inherited from main: text before `<think>` lands
-        in reasoning or content depending on where the chunk boundary falls."""
-        text = "lead<think>r</think>tail"
-        variants = {
-            self._feed(Qwen3Detector(), text, chunk_size)
-            for chunk_size in self.CHUNK_SIZES
-        }
-
-        self.assertEqual(
-            variants,
-            {("r", "leadtail"), ("", text), ("leadr", "tail")},
-        )
-        # And the non-streaming path produces yet a fourth split.
-        one_shot = Qwen3Detector().detect_and_parse(text)
-        self.assertEqual(
-            (one_shot.reasoning_text, one_shot.normal_text), ("lead<think>r", "tail")
+    def test_text_before_think_token_is_content(self):
+        """Text before `<think>` is content at every chunk width and one-shot;
+        a `<think>` straddling a chunk boundary must still open the block."""
+        self._assert_invariant(
+            Qwen3Detector, "lead<think>r</think>tail", ("r", "leadtail")
         )
 
     def test_dsv4_reasoning_quoting_dsml_is_chunk_invariant(self):
