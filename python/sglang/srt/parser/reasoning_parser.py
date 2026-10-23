@@ -151,13 +151,12 @@ class BaseReasoningFormatDetector:
         )
 
     def _detect_and_parse_impl(self, text: str) -> StreamingParseResult:
-        # A response may hold several blocks, each opened by the model after
-        # content (Gemma 4 thinks again before a tool call); every block is
-        # reasoning, everything between blocks is normal text.
+        # Gemma 4 opens a further block after answer text, before a tool call.
         think_start_text = self.think_start_token + self.think_start_self_label
         reasoning_parts: List[str] = []
         normal_parts: List[str] = []
         in_reasoning = self._in_reasoning
+        opened_here = False
         rest = text
         while rest:
             if not in_reasoning:
@@ -168,12 +167,14 @@ class BaseReasoningFormatDetector:
                 normal_parts.append(rest[:start_idx])
                 rest = rest[start_idx:]
                 in_reasoning = True
+                opened_here = True
             while rest.startswith(think_start_text):
                 rest = rest[len(think_start_text) :]
 
-            if (
-                self.think_end_token not in rest
-                and self.think_end_token not in self.previous_content
+            # An end token in previous_content closed the block the prefix opened
+            # (continue_final_message); it says nothing about a block opened here.
+            if self.think_end_token not in rest and (
+                opened_here or self.think_end_token not in self.previous_content
             ):
                 # Check for tool_start_token interruption
                 tool_idx = self._find_tool_start(rest)
@@ -192,7 +193,6 @@ class BaseReasoningFormatDetector:
                 in_reasoning = False
                 continue
 
-            # think_end_token is in self.previous_content for continue_final_message=True case
             normal_parts.append(rest)
             break
 
@@ -235,14 +235,17 @@ class BaseReasoningFormatDetector:
             return StreamingParseResult()
 
         # Strip `<think>` token if present, for the first block or a later one
-        # the model opens after it has begun answering.
-        if think_start_text in current_text and (
-            not self.stripped_think_start or not self._in_reasoning
-        ):
-            start_idx = current_text.find(think_start_text)
+        # the model opens after it has begun answering. A start token after the
+        # open block's end belongs to the remainder that the end branch reparses.
+        start_idx = current_text.find(think_start_text)
+        end_idx = current_text.find(self.think_end_token)
+        opens_block = (
+            start_idx != -1
+            and (not self.stripped_think_start or not self._in_reasoning)
+            and not (self._in_reasoning and -1 < end_idx < start_idx)
+        )
+        if opens_block:
             if not self._in_reasoning and start_idx > 0:
-                # Content before the block goes out first; the block follows
-                # with the next increment or finish().
                 self._buffer = current_text[start_idx:]
                 return StreamingParseResult(normal_text=current_text[:start_idx])
             current_text = current_text.replace(think_start_text, "", 1)
@@ -257,12 +260,13 @@ class BaseReasoningFormatDetector:
 
             reasoning_text = current_text[:end_idx]
 
-            self._buffer = ""
             self._in_reasoning = False
-            normal_text = current_text[end_idx + len(self.think_end_token) :]
-
+            # The remainder may open another block or end in a prefix of one.
+            self._buffer = current_text[end_idx + len(self.think_end_token) :]
+            rest = self._parse_streaming_increment_impl("")
             return StreamingParseResult(
-                normal_text=normal_text, reasoning_text=reasoning_text
+                normal_text=rest.normal_text,
+                reasoning_text=reasoning_text + rest.reasoning_text,
             )
 
         # Continue with reasoning content
@@ -301,8 +305,7 @@ class BaseReasoningFormatDetector:
             else:
                 return StreamingParseResult()
 
-        # If we're not in a reasoning block return as normal text, minus a
-        # trailing slice that could be the start token split across chunks.
+        # Hold back a trailing slice that could be the start token split across chunks.
         if not self._in_reasoning:
             holdback = self._ends_with_partial_token(current_text, think_start_text)
             self._buffer = current_text[len(current_text) - holdback :]
@@ -354,7 +357,6 @@ class BaseReasoningFormatDetector:
             leftover = self._buffer
             self._buffer = ""
             if self.think_start_token in leftover:
-                # A block held back behind the content that preceded it.
                 return self._detect_and_parse_impl(leftover)
             return StreamingParseResult(normal_text=leftover)
 

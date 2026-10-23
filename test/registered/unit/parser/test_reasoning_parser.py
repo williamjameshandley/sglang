@@ -759,50 +759,6 @@ class TestGemma4Detector(CustomTestCase):
         result3 = self.detector.parse_streaming_increment("reasoning here")
         self.assertEqual(result3.reasoning_text, "reasoning here")
 
-    def test_detect_and_parse_text_before_block(self):
-        """Content the model wrote before its first block stays content."""
-        text = "Not sure. <|channel>thought\nsearch first<channel|>Searching."
-        result = self.detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "search first")
-        self.assertEqual(result.normal_text, "Not sure. Searching.")
-
-    def test_detect_and_parse_two_blocks(self):
-        """A second block opened mid-answer is reasoning, not content."""
-        text = (
-            "<|channel>thought\nfirst<channel|>Part one. "
-            "<|channel>thought\nsecond<channel|>Part two."
-        )
-        result = self.detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "firstsecond")
-        self.assertEqual(result.normal_text, "Part one. Part two.")
-
-    def test_streaming_second_block(self):
-        """A second block opened mid-answer is streamed as reasoning, markers stripped."""
-        reasoning, normal = "", ""
-        for chunk in (
-            "<|channel>thought\nfirst",
-            "<channel|>",
-            "Part one. ",
-            "<|channel>thought\nsecond",
-            "<channel|>",
-            "Part two.",
-        ):
-            result = self.detector.parse_streaming_increment(chunk)
-            reasoning += result.reasoning_text
-            normal += result.normal_text
-        self.assertEqual(reasoning, "firstsecond")
-        self.assertEqual(normal, "Part one. Part two.")
-
-    def test_streaming_text_and_block_in_one_chunk(self):
-        """Content before a block in the same chunk goes out first; the block follows."""
-        result = self.detector.parse_streaming_increment(
-            "Not sure. <|channel>thought\nsearch first<channel|>Searching."
-        )
-        self.assertEqual(result.normal_text, "Not sure. ")
-        self.assertEqual(result.reasoning_text, "")
-        result = self.detector.finish()
-        self.assertEqual(result.reasoning_text, "search first")
-        self.assertEqual(result.normal_text, "Searching.")
 
 
 class TestReasoningParser(CustomTestCase):
@@ -1210,6 +1166,45 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
             Qwen3Detector, "lead<think>r</think>tail", ("r", "leadtail")
         )
 
+    def test_gemma4_second_block_after_content(self):
+        """A block the model opens after it has begun answering is reasoning with
+        its markers stripped, whether it arrives in its own chunks or in one with
+        the block before it."""
+        self._assert_invariant(
+            Gemma4Detector,
+            "<|channel>thought\nfirst<channel|>Part one. "
+            "<|channel>thought\nsecond<channel|>Part two.",
+            ("firstsecond", "Part one. Part two."),
+        )
+
+    def test_forced_reasoning_second_block_keeps_first_block_whole(self):
+        """With force_reasoning the first block has no start token; a later
+        block's start token must not be taken for the first block's."""
+        self._assert_invariant(
+            DeepSeekR1Detector, "a</think>X<think>b</think>Y", ("ab", "XY")
+        )
+
+    def test_previous_turn_end_token_does_not_close_a_block_opened_now(self):
+        """continue_final_message carries the prefix's closed block in
+        previous_content; a block the model opens in this turn is still reasoning
+        when the stream ends before its end token."""
+        self._assert_invariant(
+            lambda: Qwen3Detector(
+                continue_final_message=True, previous_content="<think>old</think>"
+            ),
+            "X<think>new",
+            ("new", "X"),
+        )
+
+    def test_gemma4_text_before_first_block(self):
+        """Content before the first block stays content; the block that follows
+        in the same chunk is still reasoning."""
+        self._assert_invariant(
+            Gemma4Detector,
+            "Not sure. <|channel>thought\nsearch first<channel|>Searching.",
+            ("search first", "Not sure. Searching."),
+        )
+
     def test_dsv4_reasoning_quoting_dsml_is_chunk_invariant(self):
         """A mid-sentence mention of the DSML tag stays in reasoning at every
         chunk width and in one-shot parsing. Reachable because the DSV4 system
@@ -1556,10 +1551,8 @@ class TestContinueFinalMessage(CustomTestCase):
         self.assertEqual(result.normal_text, "new content here")
 
     def test_continue_end_in_previous_new_text_has_start_but_no_end(self):
-        """Test: think_end in previous, new text has think_start but no think_end.
-        This produces: in_reasoning=True (from think_start in text),
-        think_end NOT in processed_text, think_end IN previous_content,
-        so it falls through to the else branch that returns normal_text."""
+        """The prefix's closed block does not close a block the new text opens:
+        a truncated block opened here is reasoning."""
         detector = BaseReasoningFormatDetector(
             "<think>",
             "</think>",
@@ -1567,14 +1560,10 @@ class TestContinueFinalMessage(CustomTestCase):
             continue_final_message=True,
             previous_content="earlier <think>old</think>old answer",
         )
-        # _in_reasoning = False (think_end in previous overrides)
         self.assertFalse(detector._in_reasoning)
-        # New text has <think> (triggers in_reasoning) but no </think>
-        # think_end IS in previous_content → skips the truncated-reasoning branch
-        # think_end NOT in processed_text → falls to else that returns normal_text
         result = detector.detect_and_parse("<think>continuing reasoning")
-        self.assertEqual(result.normal_text, "continuing reasoning")
-        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "")
+        self.assertEqual(result.reasoning_text, "continuing reasoning")
 
     def test_continue_detect_parse_think_start_in_prev_but_end_also_in_prev(self):
         """Test detect_and_parse where both think tokens are in previous,
