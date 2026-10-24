@@ -1179,8 +1179,12 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
     def test_many_adjacent_blocks_in_one_chunk(self):
         """Closing a block must not recurse: a degenerate reply of back-to-back
         blocks arriving whole parses like the same reply arriving token by token."""
-        self._assert_invariant(
-            Qwen3Detector, "<think>b</think>" * 1100, ("b" * 1100, "")
+        text = "<think>b</think>" * 1100
+        self._assert_invariant(Qwen3Detector, text, ("b" * 1100, ""))
+        # CHUNK_SIZES stop short of this text; the whole reply in one increment is
+        # the case that recursed.
+        self.assertEqual(
+            self._feed(Qwen3Detector(), text, len(text)), ("b" * 1100, "")
         )
 
     def test_tool_start_opening_a_later_block_is_at_line_start(self):

@@ -233,8 +233,7 @@ class BaseReasoningFormatDetector:
             closed_reasoning.append(closed)
 
     def _parse_buffer(self) -> Tuple[Optional[StreamingParseResult], str]:
-        """One pass over the buffer: the result, or (None, reasoning) when a block
-        closed with its remainder still in the buffer."""
+        # (None, reasoning) when a block closed with its remainder still buffered.
         current_text = self._buffer
 
         think_start_text = self.think_start_token + self.think_start_self_label
