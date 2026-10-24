@@ -595,8 +595,7 @@ class SWAComponent(TreeComponent):
             return None
 
         page_size = self.tree_core.page_size
-        # Smallest page-aligned size that still covers the sliding window.
-        tail_size = (self.sliding_window_size + page_size - 1) // page_size * page_size
+        tail_size = self._page_aligned_window_size()
         leaf_len = len(leaf.key)
         if leaf_len <= tail_size:
             return None
@@ -607,6 +606,36 @@ class SWAComponent(TreeComponent):
         new_parent, action = self.tree_core._split_node(leaf.key, leaf, split_at)
         assert action is None, "fresh SWA leaf cannot be write-through-pending"
         return new_parent
+
+    def _page_aligned_window_size(self) -> int:
+        # Smallest page-aligned size that still covers the sliding window.
+        page_size = self.tree_core.page_size
+        return (self.sliding_window_size + page_size - 1) // page_size * page_size
+
+    def normalize_lock_path(
+        self, node: UnifiedTreeNode
+    ) -> Optional[CacheAction | ComponentAction]:
+        """Split the node that straddles the active-window boundary so the lock
+        pins one window of SWA pool, not the whole boundary node."""
+        ct = self.component_type
+        page_size = self.tree_core.page_size
+        remaining = self._page_aligned_window_size()
+        cur = node
+        while cur is not self.tree_core.root_node and remaining > 0:
+            value = cur.component_data[ct].value
+            if value is None:
+                cur = cur.parent
+                continue
+            if len(value) > remaining:
+                split_at = len(cur.key) - remaining
+                # A partial-page node cannot be split on a page boundary; lock it whole.
+                if page_size > 1 and split_at % page_size != 0:
+                    return None
+                _, action = self.tree_core._split_node(cur.key, cur, split_at)
+                return action
+            remaining -= len(value)
+            cur = cur.parent
+        return None
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode

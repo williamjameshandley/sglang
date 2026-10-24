@@ -6661,6 +6661,141 @@ class UnifiedRadixCacheSuite:
                 self.assertTrue(torch.equal(actual_conv, expected_conv_buf))
         cache.sanity_check()
 
+    def test_swa_lock_splits_existing_node_at_window_boundary(self):
+        """Locking a path must pin one page-aligned window of SWA pool, not the
+        whole node straddling the window boundary (1536 locked for a 1024 window
+        starved admission of an idle pool)."""
+        if self.cfg.page_size != 64 or self.cfg.sliding_window_size != 64:
+            self.skipTest("run once on the page-aligned SWA configuration")
+        cfg = CacheConfig(
+            page_size=64,
+            components=(ComponentType.FULL, ComponentType.SWA),
+            sliding_window_size=1023,
+            kv_size=4096,
+            max_context_len=4096,
+        )
+        cache, allocator, _ = build_fixture(cfg)
+        tokens = list(range(1536))
+        full = allocator.full_attn_allocator.alloc(len(tokens))
+        swa = allocator.swa_attn_allocator.alloc(len(tokens))
+        self.assertIsNotNone(full)
+        self.assertIsNotNone(swa)
+        allocator.full_to_swa_index_mapping[full] = swa
+        with mock.patch.object(
+            cache.components[ComponentType.SWA],
+            "_maybe_split_leaf_for_swa_lock",
+            return_value=None,
+        ):
+            cache.insert(InsertParams(key=RadixKey(array("q", tokens)), value=full))
+        leaf = cache.resolve_node_handle(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).last_device_node
+        )
+        self.assertEqual(len(leaf.key), 1536)
+        self.assertEqual(
+            cache.components[ComponentType.SWA]._page_aligned_window_size(), 1024
+        )
+        protected_before = cache.swa_protected_size()
+        evictable_before = cache.swa_evictable_size()
+        lock = cache.lock(leaf.id)
+        self.assertEqual(len(leaf.key), 1024)
+        self.assertEqual(len(leaf.parent.key), 512)
+        self.assertEqual(cache.swa_protected_size() - protected_before, 1024)
+        cache.unlock(lock)
+        self.assertEqual(cache.swa_protected_size(), protected_before)
+        self.assertEqual(cache.swa_evictable_size(), evictable_before)
+        cache.sanity_check()
+
+    def test_swa_lock_split_updates_pending_write_through(self):
+        """A lock-time split of a node with a pending write-through must publish
+        both halves under the same ack."""
+        if (
+            self.cfg.has_mamba
+            or self.cfg.page_size != 64
+            or self.cfg.sliding_window_size != 64
+        ):
+            self.skipTest("run once on the page-aligned SWA configuration")
+        cache, allocator, _ = build_fixture(self.cfg)
+        tokens = self._make_seq(1, 2)
+        full = self._alloc(allocator, len(tokens))
+        with mock.patch.object(
+            cache.components[ComponentType.SWA],
+            "_maybe_split_leaf_for_swa_lock",
+            return_value=None,
+        ):
+            cache.insert(InsertParams(key=RadixKey(array("q", tokens)), value=full))
+        leaf = cache.resolve_node_handle(
+            cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens)))
+            ).last_device_node
+        )
+        leaf.write_through_pending_id = 7
+        cache.ongoing_write_through[7] = _OngoingWriteThrough(leaf.id, None, [leaf.id])
+        lock = cache.lock(leaf.id)
+        self.assertEqual(
+            cache.ongoing_write_through[7].publish_node_ids,
+            [leaf.parent.id, leaf.id],
+        )
+        self.assertEqual(leaf.parent.write_through_pending_id, 7)
+        self.assertEqual(leaf.write_through_pending_id, 7)
+        cache.sanity_check()
+        cache.unlock(lock)
+        cache.ongoing_write_through.pop(7)
+        cache.sanity_check()
+
+    def test_hicache_load_back_then_lock_splits_the_restored_boundary_node(self):
+        """A host node longer than the window is restored whole (the split keys
+        on resident SWA values), and the first request lock afterwards splits
+        it with both halves resident and the locks balanced."""
+        if self._skip_unsupported_hicache_test():
+            return
+        if (
+            ComponentType.SWA not in self.cfg.components
+            or self.cfg.has_mamba
+            or self.cfg.page_size != 64
+        ):
+            self.skipTest("run once on the page-aligned SWA configuration")
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        ps = self.cfg.page_size
+        window_pages = cache.components[ComponentType.SWA]._page_aligned_window_size() // ps
+        tokens = self._make_seq(1, window_pages + 2)
+        with mock.patch.object(
+            cache.components[ComponentType.SWA],
+            "_maybe_split_leaf_for_swa_lock",
+            return_value=None,
+        ):
+            self._insert(cache, allocator, req_to_token_pool, tokens)
+        node = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        self.assertEqual(len(cache.resolve_node_handle(node).key), len(tokens))
+        self._backup_node(cache, node)
+        cache.evict(EvictParams(num_tokens=len(tokens)))
+        self.assertTrue(cache.tree_core.is_full_device_evicted(node))
+        self._load_back_node(cache, node)
+        leaf = cache.resolve_node_handle(node)
+        self.assertEqual(len(leaf.key), len(tokens))
+        protected_before = cache.swa_protected_size()
+        lock = cache.lock(node)
+        self.assertEqual(len(leaf.key), window_pages * ps)
+        self.assertEqual(len(leaf.parent.key), 2 * ps)
+        self.assertEqual(cache.swa_protected_size() - protected_before, window_pages * ps)
+        self.assertIsNotNone(_device_value(cache, leaf.id, ComponentType.FULL))
+        self.assertIsNotNone(_device_value(cache, leaf.parent.id, ComponentType.FULL))
+        self.assertEqual(
+            len(cache.path_device_indices(
+                cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)))
+                ).last_device_node
+            )),
+            len(tokens),
+        )
+        cache.sanity_check()
+        cache.unlock(lock)
+        self.assertEqual(cache.swa_protected_size(), protected_before)
+        cache.sanity_check()
+
     def test_hicache_backup_continuity(self):
         """Backed-up nodes form a continuous prefix from the root."""
         if self._skip_unsupported_hicache_test():

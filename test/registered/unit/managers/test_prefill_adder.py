@@ -1249,6 +1249,45 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.assertIn(req, adder.can_run_list)
 
+    def test_cached_resume_admission_at_normalized_swa_lock_state(self):
+        # A cached-prefix resume needs 1087 SWA slots (243 extend + 1024 decode
+        # capped at the 1023 window, page 64). With the boundary node locked
+        # whole, 384 free + 448 evictable refuses it; with the node split at the
+        # window the same pool offers 384 + 960 and admits it.
+        WINDOW, PAGE = 1023, 64
+        PREFIX, EXTEND, MAX_NEW = 1792, 243, 1024
+        self.mock_token_allocator.full_available_size.return_value = 260_352
+        self.mock_token_allocator.available_size.return_value = 260_352
+        self.mock_token_allocator.swa_available_size.return_value = 384
+        self.mock_tree_cache.sliding_window_size = WINDOW
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        req = self.create_mock_req("cached-resume", priority=0, max_new_tokens=MAX_NEW)
+        req.prefix_len = PREFIX
+        req.full_untruncated_fill_ids = list(range(PREFIX + EXTEND))
+        req.last_node = MagicMock()
+
+        def adder_with_evictable(swa_evictable):
+            self.mock_tree_cache.swa_evictable_size.return_value = swa_evictable
+            adder = self.create_adder(self.create_running_batch(), page_size=PAGE)
+            adder.is_hybrid_swa = True
+            adder.memory_budget = SWAPrefillBudget(
+                self.mock_token_allocator, self.mock_tree_cache
+            )
+            return adder
+
+        blocked = adder_with_evictable(448)
+        self.assertEqual(blocked.memory_budget.swa_tokens(EXTEND, MAX_NEW), 1087)
+        self.assertIs(
+            blocked.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.NO_TOKEN,
+        )
+        admitted = adder_with_evictable(960)
+        self.assertIsNot(
+            admitted.add_one_req(req, has_chunked_req=False, truncation_align_size=None),
+            AddReqResult.NO_TOKEN,
+        )
+        self.assertIn(req, admitted.can_run_list)
+
     def test_load_back_delivery_mismatch_reselects_the_prefill_shape(self):
         # Two incidents: a load that delivers nothing left the SWA gate sized
         # for the tail and the allocator OOMed; a cache-mode load that also

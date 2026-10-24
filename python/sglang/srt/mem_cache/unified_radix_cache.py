@@ -997,6 +997,18 @@ class UnifiedRadixCache(BasePrefixCache):
             return IncLockRefResult()
         return self.tree_core.inc_lock_ref(node_id, skip_lock_components)
 
+    def _split_swa_window_boundary(
+        self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
+    ) -> None:
+        # Request locks pin one SWA window; internal backup locks leave the
+        # topology alone so their snapshots stay valid.
+        swa = self.components.get(ComponentType.SWA)
+        if swa is None or ComponentType.SWA in skip_lock_components:
+            return
+        action = swa.normalize_lock_path(self.tree_core.node_by_id(node_id))
+        if action is not None:
+            self._apply_cache_action(action)
+
     def dec_lock_ref(
         self,
         node_id: NodeId,
@@ -1013,6 +1025,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # A session's virtual node stands for a lock its slot already holds.
         if is_virtual_node(node_id):
             return None
+        if not self.disable:
+            self._split_swa_window_boundary(node_id, skip_lock_components)
         result = self.inc_lock_ref(node_id, skip_lock_components)
         return TreeLock(node_id, result.to_dec_params())
 
