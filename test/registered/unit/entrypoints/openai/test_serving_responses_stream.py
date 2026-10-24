@@ -829,6 +829,50 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
         self.assertTrue(all(i["name"] for i in items))
         self.assertEqual(items[0]["arguments"], '{"city": "Beijing"}')
 
+    def test_repeated_gemma4_calls_stream_as_separate_items(self):
+        """Consecutive calls to one function must become one function_call item
+        each, with that call's arguments, not one item whose arguments are the
+        calls' JSON objects concatenated."""
+        serving = make_serving()
+        serving.reasoning_parser = "gemma4"
+        serving.tool_call_parser = "gemma4"
+        request = ResponsesRequest(
+            model="x",
+            input="three agents",
+            stream=True,
+            store=False,
+            tools=[
+                {
+                    "type": "function",
+                    "name": "spawn_agent",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                    },
+                }
+            ],
+        )
+        text = "".join(
+            f'<|tool_call>call:spawn_agent{{message:<|"|>{m}<|"|>}}<tool_call|>'
+            for m in ("one", "two", "three")
+        )
+        for chunk_size in (1, 7, len(text)):
+            with self.subTest(chunk_size=chunk_size):
+                chunks = [
+                    engine_chunk(text[:i], i, finish=i >= len(text))
+                    for i in range(chunk_size, len(text) + chunk_size, chunk_size)
+                ]
+                payloads = event_payloads(StreamFixture(serving, request).run(chunks))
+                calls = [
+                    o
+                    for o in payloads[-1]["response"]["output"]
+                    if o["type"] == "function_call"
+                ]
+                self.assertEqual(
+                    [json.loads(c["arguments"]) for c in calls],
+                    [{"message": m} for m in ("one", "two", "three")],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
