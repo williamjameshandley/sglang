@@ -72,6 +72,26 @@ def custom_tool_names(tools: Any) -> Set[str]:
     return {tool.name for tool in tools or [] if tool.type == "custom" and tool.name}
 
 
+def namespaced_tool_identities(tools: Any) -> Dict[str, Tuple[str, str]]:
+    # Chat templates take a flat function list, so a namespace member is offered
+    # as ``namespace.name``; this maps that back to (namespace, name).
+    return {
+        f"{tool.name}.{member['name']}": (tool.name, member["name"])
+        for tool in tools or []
+        if tool.type == "namespace"
+        for member in tool.tools
+    }
+
+
+def function_identity(name: str, identities: Dict[str, Tuple[str, str]]) -> dict:
+    # Matched against declared members, not split on dots: a top-level function
+    # name may itself contain dots.
+    if name in identities:
+        namespace, member = identities[name]
+        return {"name": member, "namespace": namespace}
+    return {"name": name}
+
+
 def encode_custom_tool_input(payload: str) -> str:
     return json.dumps({CUSTOM_TOOL_INPUT_KEY: payload}, ensure_ascii=False)
 

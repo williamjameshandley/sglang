@@ -1804,7 +1804,21 @@ class ResponseTool(BaseModel):
     def validate_function_tool(self) -> ResponseTool:
         if self.type == "function" and not self.name:
             raise ValueError("Function tools must include a name.")
+        if self.type == "namespace":
+            if not self.name or self.tools is None:
+                raise ValueError("Namespace tools must include a name and tools.")
+            for tool in self.tools:
+                if tool.get("type") != "function" or not tool.get("name"):
+                    raise ValueError(
+                        "A namespace can contain only named function tools."
+                    )
         return self
+
+
+class ResponseNamespacedFunctionToolCall(ResponseFunctionToolCall):
+    # The SDK's input TypedDict has no ``namespace`` field and would drop it on
+    # replay; a model arm keeps the call's identity through the union.
+    namespace: str
 
 
 class ResponseInputMessageParam(EasyInputMessageParam, total=False):
@@ -1816,6 +1830,7 @@ class ResponseOutputMessage(OpenAIResponseOutputMessage):
 
 
 ResponseInputOutputItem: TypeAlias = Union[
+    ResponseNamespacedFunctionToolCall,
     ResponseInputMessageParam,
     ResponseOutputMessage,
     ResponseInputItemParam,
@@ -2019,6 +2034,8 @@ class ResponsesRequest(PDRoutingFields):
             "name"
         )
         if tool_choice.get("type") in ("function", "custom") and name:
+            if namespace := tool_choice.get("namespace"):
+                name = f"{namespace}.{name}"
             return {"type": "function", "name": name}
         return "auto"
 
@@ -2334,6 +2351,7 @@ class ResponseReasoningTextContent(BaseModel):
 
 
 ResponseInputOutputItem: TypeAlias = Union[
+    ResponseNamespacedFunctionToolCall,
     ResponseInputMessageParam,
     ResponseOutputMessage,
     ResponseInputItemParam,
