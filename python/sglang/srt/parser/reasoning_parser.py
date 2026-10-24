@@ -214,11 +214,10 @@ class BaseReasoningFormatDetector:
         ret = self._parse_streaming_increment_impl(new_text)
         if ret.normal_text:
             self._content_streamed = True
-        if self._force_nonempty_content:
-            if self._in_reasoning:
-                self._accumulated_reasoning += ret.reasoning_text
-            else:
-                self._accumulated_reasoning = ""
+        if self._force_nonempty_content and not self._content_streamed:
+            # Across blocks, not per block: what finish() promotes must not
+            # depend on where the chunk boundaries fell.
+            self._accumulated_reasoning += ret.reasoning_text
         return ret
 
     def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:

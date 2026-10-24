@@ -1212,6 +1212,20 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
                     ("ab", "X"),
                 )
 
+    def test_force_nonempty_content_promotes_all_blocks_when_no_content(self):
+        """With no content at all, what finish() promotes is every block's
+        reasoning at every chunk width; one-shot promotes the same text."""
+        text = "<think>a</think><think>b"
+        for stream_reasoning in (False, True):
+            for chunk_size in self.CHUNK_SIZES:
+                with self.subTest(stream_reasoning=stream_reasoning, chunk_size=chunk_size):
+                    detector = Qwen3Detector(
+                        stream_reasoning=stream_reasoning, force_nonempty_content=True
+                    )
+                    self.assertEqual(self._feed(detector, text, chunk_size)[1], "ab")
+        one_shot = Qwen3Detector(force_nonempty_content=True).detect_and_parse(text)
+        self.assertEqual((one_shot.reasoning_text, one_shot.normal_text), ("", "ab"))
+
     def test_forced_reasoning_second_block_keeps_first_block_whole(self):
         """With force_reasoning the first block has no start token; a later
         block's start token must not be taken for the first block's."""
