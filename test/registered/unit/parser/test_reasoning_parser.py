@@ -1197,6 +1197,21 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
             ("a", tool_call),
         )
 
+    def test_force_nonempty_content_keeps_truncated_later_block_as_reasoning(self):
+        """force_nonempty_content promotes reasoning only to avoid an empty answer;
+        once content has gone out, a later block cut off by the stream end stays
+        reasoning rather than being appended, or duplicated, into content."""
+        for stream_reasoning in (False, True):
+            with self.subTest(stream_reasoning=stream_reasoning):
+                self._assert_invariant(
+                    lambda: Qwen3Detector(
+                        stream_reasoning=stream_reasoning,
+                        force_nonempty_content=True,
+                    ),
+                    "<think>a</think>X<think>b",
+                    ("ab", "X"),
+                )
+
     def test_forced_reasoning_second_block_keeps_first_block_whole(self):
         """With force_reasoning the first block has no start token; a later
         block's start token must not be taken for the first block's."""

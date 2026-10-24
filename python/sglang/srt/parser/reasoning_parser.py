@@ -95,6 +95,7 @@ class BaseReasoningFormatDetector:
 
         self._buffer = ""
         self._streamed_reasoning_tail = ""
+        self._content_streamed = False
         self.stripped_think_start = False
         self.think_start_self_label = ""
 
@@ -211,6 +212,8 @@ class BaseReasoningFormatDetector:
             Streams reasoning content as it arrives
         """
         ret = self._parse_streaming_increment_impl(new_text)
+        if ret.normal_text:
+            self._content_streamed = True
         if self._force_nonempty_content:
             if self._in_reasoning:
                 self._accumulated_reasoning += ret.reasoning_text
@@ -377,7 +380,8 @@ class BaseReasoningFormatDetector:
         buffer = self._strip_partial_tool_start(buffer, self._streamed_reasoning_tail)
         self._buffer = ""
 
-        if self._force_nonempty_content:
+        # Promotion exists to avoid an empty answer; content already sent settles that.
+        if self._force_nonempty_content and not self._content_streamed:
             normal_text = self._accumulated_reasoning + buffer
             self._accumulated_reasoning = ""
             if normal_text:
