@@ -34,28 +34,28 @@ def estimate_swa_kv_tokens(
     host_hit_length: int = 0,
 ) -> int:
     """Peak SWA reservation for one prefill/decode request."""
+    restored = -(-host_hit_length // page_size) * page_size
     if sliding_window_size is None or sliding_window_size <= 0:
-        reserved = extend_input_len + max_new_tokens + page_size
+        reserved = extend_input_len + max_new_tokens + page_size + restored
     else:
         allocated = (
             extend_input_len
             if allocation_limit is None
             else min(extend_input_len, allocation_limit)
         )
-        allocated_tail = max(allocated - sliding_window_size, 0)
+        allocated_tail = max(allocated + restored - sliding_window_size, 0)
         # With a roughly two-window SWA pool, a cached prefix can already lock
         # one window. Charging another whole window for a short resume can then
         # block admission forever on an idle pool. Reserve only its uncached
-        # tail plus decode headroom, capped at the window.
+        # tail plus decode headroom, capped at the window; a host-restored
+        # prefix occupies that same window, so it counts inside the cap.
         # Including the extension also keeps the reservation large enough for
         # this pass's prefill allocation.
         reserved = (
             allocated_tail
-            + min(extend_input_len + max_new_tokens, sliding_window_size)
+            + min(extend_input_len + max_new_tokens + restored, sliding_window_size)
             + page_size
         )
-    if host_hit_length > 0:
-        reserved += -(-host_hit_length // page_size) * page_size
     return reserved
 
 
