@@ -220,6 +220,21 @@ class BaseReasoningFormatDetector:
 
     def _parse_streaming_increment_impl(self, new_text: str) -> StreamingParseResult:
         self._buffer += new_text
+        # A chunk may close several blocks; each pass consumes one and leaves
+        # the remainder in the buffer.
+        closed_reasoning: List[str] = []
+        while True:
+            result, closed = self._parse_buffer()
+            if result is not None:
+                return StreamingParseResult(
+                    normal_text=result.normal_text,
+                    reasoning_text="".join(closed_reasoning) + result.reasoning_text,
+                )
+            closed_reasoning.append(closed)
+
+    def _parse_buffer(self) -> Tuple[Optional[StreamingParseResult], str]:
+        """One pass over the buffer: the result, or (None, reasoning) when a block
+        closed with its remainder still in the buffer."""
         current_text = self._buffer
 
         think_start_text = self.think_start_token + self.think_start_self_label
@@ -232,11 +247,10 @@ class BaseReasoningFormatDetector:
             token.startswith(current_text) and token != current_text
             for token in tokens_to_check
         ):
-            return StreamingParseResult()
+            return StreamingParseResult(), ""
 
-        # Strip `<think>` token if present, for the first block or a later one
-        # the model opens after it has begun answering. A start token after the
-        # open block's end belongs to the remainder that the end branch reparses.
+        # Strip the start token of the first block, or of a later one opened after
+        # answer text; one after the open block's end waits for the next pass.
         start_idx = current_text.find(think_start_text)
         end_idx = current_text.find(self.think_end_token)
         opens_block = (
@@ -247,27 +261,20 @@ class BaseReasoningFormatDetector:
         if opens_block:
             if not self._in_reasoning and start_idx > 0:
                 self._buffer = current_text[start_idx:]
-                return StreamingParseResult(normal_text=current_text[:start_idx])
+                return StreamingParseResult(normal_text=current_text[:start_idx]), ""
             current_text = current_text.replace(think_start_text, "", 1)
             # Write back, or stream_reasoning=False carries the token into finish().
             self._buffer = current_text
             self.stripped_think_start = True
             self._in_reasoning = True
+            self._streamed_reasoning_tail = ""
 
         # Handle end of reasoning block
         if self._in_reasoning and self.think_end_token in current_text:
             end_idx = current_text.find(self.think_end_token)
-
-            reasoning_text = current_text[:end_idx]
-
             self._in_reasoning = False
-            # The remainder may open another block or end in a prefix of one.
             self._buffer = current_text[end_idx + len(self.think_end_token) :]
-            rest = self._parse_streaming_increment_impl("")
-            return StreamingParseResult(
-                normal_text=rest.normal_text,
-                reasoning_text=reasoning_text + rest.reasoning_text,
-            )
+            return None, current_text[:end_idx]
 
         # Continue with reasoning content
         if self._in_reasoning:
@@ -282,8 +289,11 @@ class BaseReasoningFormatDetector:
                 normal_text = current_text[tool_idx:]
                 self._buffer = ""
                 self._in_reasoning = False
-                return StreamingParseResult(
-                    normal_text=normal_text, reasoning_text=reasoning_text
+                return (
+                    StreamingParseResult(
+                        normal_text=normal_text, reasoning_text=reasoning_text
+                    ),
+                    "",
                 )
             if self.stream_reasoning:
                 # Minus any trailing slice that could be a token split across chunks.
@@ -301,19 +311,21 @@ class BaseReasoningFormatDetector:
                 reasoning_text = current_text[: len(current_text) - holdback]
                 if reasoning_text:
                     self._streamed_reasoning_tail = reasoning_text[-1]
-                return StreamingParseResult(reasoning_text=reasoning_text)
+                return StreamingParseResult(reasoning_text=reasoning_text), ""
             else:
-                return StreamingParseResult()
+                return StreamingParseResult(), ""
 
-        # Hold back a trailing slice that could be the start token split across chunks.
         if not self._in_reasoning:
             holdback = self._ends_with_partial_token(current_text, think_start_text)
             self._buffer = current_text[len(current_text) - holdback :]
-            return StreamingParseResult(
-                normal_text=current_text[: len(current_text) - holdback]
+            return (
+                StreamingParseResult(
+                    normal_text=current_text[: len(current_text) - holdback]
+                ),
+                "",
             )
 
-        return StreamingParseResult()
+        return StreamingParseResult(), ""
 
     def _strip_leading_think_start(self, text: str) -> str:
         think_start_text = self.think_start_token + self.think_start_self_label

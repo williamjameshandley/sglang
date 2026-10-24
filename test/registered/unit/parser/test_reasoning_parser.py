@@ -1168,13 +1168,29 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
 
     def test_gemma4_second_block_after_content(self):
         """A block the model opens after it has begun answering is reasoning with
-        its markers stripped, whether it arrives in its own chunks or in one with
-        the block before it."""
+        its markers stripped, in its own chunks or in one with the block before."""
         self._assert_invariant(
             Gemma4Detector,
             "<|channel>thought\nfirst<channel|>Part one. "
             "<|channel>thought\nsecond<channel|>Part two.",
             ("firstsecond", "Part one. Part two."),
+        )
+
+    def test_many_adjacent_blocks_in_one_chunk(self):
+        """Closing a block must not recurse: a degenerate reply of back-to-back
+        blocks arriving whole parses like the same reply arriving token by token."""
+        self._assert_invariant(
+            Qwen3Detector, "<think>b</think>" * 1100, ("b" * 1100, "")
+        )
+
+    def test_tool_start_opening_a_later_block_is_at_line_start(self):
+        """A later block starts a line: a tool marker opening it ends reasoning,
+        as it does when the same reply arrives whole."""
+        tool_call = "<｜DSML｜tool_calls>x"
+        self._assert_invariant(
+            DeepSeekV4Detector,
+            f"<think>a</think><think>{tool_call}",
+            ("a", tool_call),
         )
 
     def test_forced_reasoning_second_block_keeps_first_block_whole(self):
@@ -1185,9 +1201,8 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
         )
 
     def test_previous_turn_end_token_does_not_close_a_block_opened_now(self):
-        """continue_final_message carries the prefix's closed block in
-        previous_content; a block the model opens in this turn is still reasoning
-        when the stream ends before its end token."""
+        """continue_final_message carries the prefix's closed block; a block the
+        model opens in this turn is reasoning even when the stream ends inside it."""
         self._assert_invariant(
             lambda: Qwen3Detector(
                 continue_final_message=True, previous_content="<think>old</think>"
