@@ -830,9 +830,8 @@ class MultiToolCallStreamingOrderTestCase(CustomTestCase):
         self.assertEqual(items[0]["arguments"], '{"city": "Beijing"}')
 
     def test_repeated_gemma4_calls_stream_as_separate_items(self):
-        """Consecutive calls to one function must become one function_call item
-        each, with that call's arguments, not one item whose arguments are the
-        calls' JSON objects concatenated."""
+        """Consecutive calls to one function are one function_call item each,
+        not one item with the calls' JSON arguments concatenated."""
         serving = make_serving()
         serving.reasoning_parser = "gemma4"
         serving.tool_call_parser = "gemma4"
