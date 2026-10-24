@@ -34,6 +34,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesRequest,
     ResponsesResponse,
 )
+from sglang.srt.entrypoints.openai.responses_adapters import (
+    function_identity,
+    namespaced_tool_identities,
+)
 from sglang.srt.entrypoints.openai.serving_responses import (
     OpenAIServingResponses,
     _build_output_text_logprobs,
@@ -1789,6 +1793,208 @@ def test_pd_tool_continuation_stops_before_side_effect(response_serving):
         asyncio.run(run())
     context.call_tool.assert_not_awaited()
     assert serving.tokenizer_manager.generate_request.call_count == 1
+
+
+def _namespace_tool(name):
+    return {
+        "type": "namespace",
+        "name": name,
+        "description": "Weather tools",
+        "tools": [
+            {
+                "type": "function",
+                "name": "lookup",
+                "description": "Look up the weather",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+                "strict": True,
+            }
+        ],
+    }
+
+
+class NamespaceToolsTestCase(CustomTestCase):
+    """A ``namespace`` tool's members reach the model as ``namespace.name``
+    function tools and come back split into ``name`` and ``namespace``, in the
+    one-shot and streaming paths and on stateless replay of a past call."""
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        self.serving = make_serving()
+        self.request = ResponsesRequest(
+            model="test-model",
+            input="weather",
+            tools=[_namespace_tool("weather")],
+            store=False,
+        )
+
+    def test_flattening_preserves_schemas_and_distinguishes_namespaces(self):
+        request = ResponsesRequest(
+            model="test-model",
+            input="weather",
+            tools=[_namespace_tool("weather"), _namespace_tool("travel")],
+        )
+        tools = self.serving._response_tools_to_chat_tools(request)
+        self.assertEqual(
+            [t.function.name for t in tools], ["weather.lookup", "travel.lookup"]
+        )
+        member = _namespace_tool("weather")["tools"][0]
+        self.assertEqual(tools[0].function.parameters, member["parameters"])
+        self.assertEqual(tools[0].function.description, member["description"])
+        self.assertTrue(tools[0].function.strict)
+
+    def test_qualified_name_collision_is_rejected_either_way_round(self):
+        top_level = {"type": "function", "name": "weather.lookup"}
+        for tools in (
+            [_namespace_tool("weather"), top_level],
+            [top_level, _namespace_tool("weather")],
+        ):
+            with self.subTest(order=[t["type"] for t in tools]):
+                request = ResponsesRequest(model="test-model", input="hi", tools=tools)
+                with self.assertRaisesRegex(ValueError, "Ambiguous function tool name"):
+                    self.serving._response_tools_to_chat_tools(request)
+
+    def test_duplicate_top_level_names_are_not_newly_rejected(self):
+        request = ResponsesRequest(
+            model="test-model",
+            input="hi",
+            tools=[
+                {"type": "function", "name": "lookup"},
+                {"type": "function", "name": "lookup"},
+            ],
+        )
+        self.assertEqual(len(self.serving._response_tools_to_chat_tools(request)), 2)
+
+    def test_dotted_top_level_function_is_not_reinterpreted(self):
+        request = ResponsesRequest(
+            model="test-model",
+            input="hi",
+            tools=[{"type": "function", "name": "weather.lookup"}],
+        )
+        identities = namespaced_tool_identities(request.tools)
+        self.assertEqual(
+            function_identity(name="weather.lookup", identities=identities),
+            {"name": "weather.lookup"},
+        )
+
+    def test_forced_namespace_tool_choice_is_qualified(self):
+        self.request.tool_choice = {
+            "type": "function",
+            "name": "lookup",
+            "namespace": "weather",
+        }
+        self.assertEqual(
+            self.request.effective_tool_choice(),
+            {"type": "function", "name": "weather.lookup"},
+        )
+
+    def test_harmony_rejects_namespace_tools(self):
+        self.serving.use_harmony = True
+        request = ResponsesRequest(
+            model="x",
+            input="weather",
+            tools=[_namespace_tool("weather")],
+            tool_choice="required",
+            store=False,
+        )
+        result = asyncio.run(self.serving.create_responses(request, raw_request=None))
+        self.assertEqual(getattr(result, "status_code", None), 400)
+
+    def _assert_namespaced_call(self, call):
+        self.assertEqual((call["name"], call["namespace"]), ("lookup", "weather"))
+
+    def test_required_json_call_and_stateless_replay_preserve_namespace(self):
+        self.request.tool_choice = "required"
+        self.serving.tool_call_parser = None
+        output = self.serving._make_response_output_items(
+            self.request,
+            '[{"name":"weather.lookup","parameters":{"city":"Paris"}}]',
+            tokenizer=Mock(),
+            require_reasoning=False,
+        )
+        call = output[0].model_dump(exclude_none=True)
+        self._assert_namespaced_call(call)
+        for tool_output in ("sunny", [{"type": "input_text", "text": "sunny"}]):
+            with self.subTest(tool_output=tool_output):
+                replay = ResponsesRequest(
+                    model="test-model",
+                    store=False,
+                    tools=[_namespace_tool("weather")],
+                    input=[
+                        {"role": "user", "content": "weather"},
+                        call,
+                        {
+                            "type": "function_call_output",
+                            "call_id": call["call_id"],
+                            "output": tool_output,
+                        },
+                    ],
+                )
+                messages = self.serving._construct_input_messages(replay)
+                self.assertEqual(
+                    messages[1]["tool_calls"][0]["function"]["name"], "weather.lookup"
+                )
+                self.assertEqual(messages[2]["tool_call_id"], call["call_id"])
+        self.assertFalse(self.serving.response_store)
+        self.assertFalse(self.serving.msg_store)
+
+    @staticmethod
+    def _qwen3_coder_call():
+        from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+
+        d = Qwen3CoderDetector()
+        return (
+            f"{d.tool_call_start_token}{d.tool_call_prefix}weather.lookup>"
+            f"{d.parameter_prefix}city>Paris{d.parameter_end_token}"
+            f"{d.function_end_token}{d.tool_call_end_token}"
+        )
+
+    def test_native_parser_call_preserves_namespace(self):
+        self.serving.tool_call_parser = "qwen3_coder"
+        output = self.serving._make_response_output_items(
+            self.request,
+            self._qwen3_coder_call(),
+            tokenizer=Mock(),
+            require_reasoning=False,
+        )
+        calls = [o for o in output if o.type == "function_call"]
+        self.assertEqual(len(calls), 1)
+        self._assert_namespaced_call(calls[0].model_dump(exclude_none=True))
+
+    def test_streaming_call_preserves_namespace_in_every_event(self):
+        self.serving.tool_call_parser = "qwen3_coder"
+        text = self._qwen3_coder_call()
+        events = StreamFixture(self.serving, self.request).run_seq(
+            [engine_chunk(text), engine_chunk(text, finish=True)]
+        )
+        items = [
+            p["item"]
+            for t, p in events
+            if t in ("response.output_item.added", "response.output_item.done")
+            and p["item"]["type"] == "function_call"
+        ]
+        self.assertEqual(len(items), 2)
+        for item in items:
+            self._assert_namespaced_call(item)
+        done = [p for t, p in events if t == "response.function_call_arguments.done"]
+        self.assertEqual(len(done), 1)
+        self._assert_namespaced_call(done[0])
+        final = next(p["response"] for t, p in events if t == "response.completed")
+        self._assert_namespaced_call(final["output"][-1])
+        self.assertFalse(self.serving.response_store)
+
+    def test_nested_namespaces_and_missing_member_names_are_rejected(self):
+        for member in (_namespace_tool("nested"), {"type": "function"}):
+            with self.subTest(member=member), self.assertRaises(ValueError):
+                ResponsesRequest(
+                    model="test-model",
+                    input="hi",
+                    tools=[{"type": "namespace", "name": "weather", "tools": [member]}],
+                )
 
 
 if __name__ == "__main__":

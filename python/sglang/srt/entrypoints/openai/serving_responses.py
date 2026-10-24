@@ -321,6 +321,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             }
         except ValueError as exc:
             return self.create_error_response(str(exc), param="tools")
+        if self.use_harmony and any(
+            tool.type == "namespace" for tool in request.tools or []
+        ):
+            return self.create_error_response(
+                "namespace tools are not supported with the harmony format",
+                param="tools",
+            )
 
         # ``tool_choice="required"`` needs a tool the parser can actually force.
         if request.tool_choice == "required" and not chat_tool_names:
@@ -942,7 +949,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             arguments=arguments,
             call_id=call_id,
             type="function_call",
-            **function_identity(name, namespaces),
+            **function_identity(name=name, identities=namespaces),
             id=f"fc_{random_uuid()[:8]}",
             status="completed",
         )
@@ -1182,10 +1189,10 @@ class OpenAIServingResponses(OpenAIServingChat):
 
     @staticmethod
     def _response_tools_to_chat_tools(request: ResponsesRequest) -> list[Tool]:
-        # ``function``, ``custom`` and ``namespace`` tools flow to chat; built-ins
-        # go through harmony. A custom tool is shimmed into a single-string
-        # function tool; a namespace member is offered as ``namespace.name``.
+        # ``function``, ``custom`` and ``namespace`` tools flow to chat; built-ins go
+        # through harmony. A custom tool is shimmed into a single-string function.
         chat_tools = []
+        qualified = set()
         for tool in request.tools:
             if tool.type == "function":
                 members = [(tool.name, tool.description, tool.parameters, tool.strict)]
@@ -1211,8 +1218,15 @@ class OpenAIServingResponses(OpenAIServingChat):
             else:
                 continue
             for name, description, parameters, strict in members:
-                if any(t.function.name == name for t in chat_tools):
+                # A member's qualified name must not double as another tool's name,
+                # or the call could not be routed back to one of them.
+                if name in qualified or (
+                    tool.type == "namespace"
+                    and any(t.function.name == name for t in chat_tools)
+                ):
                     raise ValueError(f"Ambiguous function tool name: {name!r}")
+                if tool.type == "namespace":
+                    qualified.add(name)
                 chat_tools.append(
                     Tool(
                         type="function",
@@ -2292,7 +2306,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                 completed_item = ResponseFunctionToolCall(
                     arguments=arguments,
                     call_id=state["call_id"],
-                    **function_identity(state["name"] or "", namespaces),
+                    **function_identity(name=state["name"] or "", identities=namespaces),
                     type="function_call",
                     id=state["item_id"],
                     status="completed",
@@ -2305,7 +2319,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                             item_id=state["item_id"],
                             output_index=state["output_index"],
                             arguments=arguments,
-                            **function_identity(state["name"] or "", namespaces),
+                            **function_identity(name=state["name"] or "", identities=namespaces),
                         )
                     )
                 )
@@ -2518,7 +2532,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                                 added_item = ResponseFunctionToolCall(
                                     arguments="",
                                     call_id=state["call_id"],
-                                    **function_identity(state["name"], namespaces),
+                                    **function_identity(name=state["name"], identities=namespaces),
                                     type="function_call",
                                     id=state["item_id"],
                                     status="in_progress",
