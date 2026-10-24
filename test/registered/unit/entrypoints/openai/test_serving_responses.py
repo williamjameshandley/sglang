@@ -1902,7 +1902,7 @@ class NamespaceToolsTestCase(CustomTestCase):
             store=False,
         )
         result = asyncio.run(self.serving.create_responses(request, raw_request=None))
-        self.assertEqual(getattr(result, "status_code", None), 400)
+        self.assertEqual(result.status_code, 400)
 
     def _assert_namespaced_call(self, call):
         self.assertEqual((call["name"], call["namespace"]), ("lookup", "weather"))
