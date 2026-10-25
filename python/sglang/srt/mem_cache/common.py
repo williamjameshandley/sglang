@@ -35,6 +35,22 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def new_pages_for_alloc(allocated_len: int, next_alloc_len: int, page_size: int) -> int:
+    """Pages alloc_extend adds when allocated_len grows by next_alloc_len."""
+    if page_size == 1:
+        return next_alloc_len
+    return (
+        ceil_align(allocated_len + next_alloc_len, page_size)
+        - ceil_align(allocated_len, page_size)
+    ) // page_size
+
+
+def new_tokens_for_alloc(
+    allocated_len: int, next_alloc_len: int, page_size: int
+) -> int:
+    return new_pages_for_alloc(allocated_len, next_alloc_len, page_size) * page_size
+
+
 class RetractionBackup(NamedTuple):
     cpu_tensors: Any = None
     host_indices: Optional[torch.Tensor] = None

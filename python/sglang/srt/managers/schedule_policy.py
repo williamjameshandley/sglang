@@ -67,7 +67,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     zero_match_result,
 )
-from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
+from sglang.srt.mem_cache.common import (
+    match_kv_cache,
+    new_tokens_for_alloc,
+    touch_waiting_prefix,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_cache.components import (
     CacheTransferPhase,
@@ -699,11 +703,10 @@ class PrefillAdder:
         self.kv_shard_block_bound_pages = 0
         self.kv_shard_chunk_pages = 0
         # Reserve one extra page per shard class for allocation rounding.
-        self.per_req_token_overhead = (
-            kv_shard_size * self.kv_shard_granule
-            if self.kv_shard_granule
-            else self.page_size
+        self.kv_shard_token_reserve = (
+            kv_shard_size * self.kv_shard_granule if self.kv_shard_granule else 0
         )
+        self.per_req_token_overhead = self.kv_shard_token_reserve or self.page_size
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
@@ -1342,15 +1345,21 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        # Reserve page_size for page-alignment overhead: the paged allocator may
-        # consume one extra page per request (see alloc_extend), which
-        # _update_prefill_budget also deducts.
         max_new = min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
         )
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
-        total_tokens = cand_extend_input_len + max_new + self.per_req_token_overhead
+        # The final sampled token is returned without a KV slot; count the pages
+        # alloc_extend will add beyond the prefix's last page.
+        total_tokens = (
+            new_tokens_for_alloc(
+                req.prefix_len,
+                cand_extend_input_len + max(max_new - 1, 0),
+                self.page_size,
+            )
+            + self.kv_shard_token_reserve
+        )
         # Reserve request and load-back state slots before init_load_back binds
         # the request slot. Reuse this reservation when committing admission.
         mamba_gap_reserve = self._mamba_gap_budget_for_req(req, include_host_hit=True)

@@ -124,7 +124,7 @@ class PrefillBudget:
         """Return admission feasibility and a memory bound on the requested chunk."""
         return (
             (True, chunk_limit)
-            if total_tokens < self.remaining_total
+            if total_tokens <= self.remaining_total
             else (False, None)
         )
 
@@ -236,7 +236,7 @@ class SWAPrefillBudget(PrefillBudget):
         swa_host_hit_length: int,
         chunk_limit: int | None,
     ) -> tuple[bool, int | None]:
-        if total_tokens >= self.remaining_total:
+        if total_tokens > self.remaining_total:
             return False, None
         extend_input_len = self.ceil_paged_tokens(extend_input_len)
         needed = self.swa_tokens(

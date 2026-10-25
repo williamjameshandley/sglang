@@ -98,11 +98,10 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         token_capacity is the scheduler's configured capacity, including its
         distributed token scaling. Shared pools use their physical byte layout.
+        A request writes input_tokens + max_new_tokens - 1 KV slots: the final
+        sampled token is returned without one.
         """
-        paged_input = -(-input_tokens // self.page_size) * self.page_size
-        return max(
-            0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
-        )
+        return max(0, min(max_new_tokens, token_capacity - input_tokens + 1))
 
     def prealloc_fits_assumes_reclaim(self) -> bool:
         """Whether `prealloc_fits` answers about the state reachable AFTER

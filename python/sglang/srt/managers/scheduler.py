@@ -2607,12 +2607,11 @@ class Scheduler(
                 self.max_req_len - input_len + 1,
             ),
         )
-        # PrefillAdder reserves one page per shard; the allocator reserves one.
-        # Subtract the other N - 1 pages to keep queue admission schedulable.
-        token_capacity = (
-            self.max_total_num_tokens * self.kv_shard_widening
-            - self.page_size * (self.kv_shard_widening - 1)
-        )
+        # A sharded pool's PrefillAdder reserves one page per shard; subtract
+        # them all so the clip never admits what the adder refuses.
+        token_capacity = self.max_total_num_tokens * self.kv_shard_widening
+        if self.kv_shard_widening > 1:
+            token_capacity -= self.page_size * self.kv_shard_widening
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,

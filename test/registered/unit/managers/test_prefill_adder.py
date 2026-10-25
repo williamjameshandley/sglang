@@ -13,6 +13,7 @@ from sglang.srt.managers.schedule_policy import (
     estimate_prefill_extend_tile_metrics,
 )
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.common import new_tokens_for_alloc
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -388,6 +389,52 @@ class TestPrefillAdder(CustomTestCase):
             AddReqResult.NO_TOKEN,
         )
         self.assertEqual(adder.can_run_list, [first])
+
+    def test_full_kv_page_boundary_admission(self):
+        """A request may fill the pool exactly: it writes input + max_new - 1
+        KV slots, page-ceiled, and no page beyond that is reserved."""
+        page_size, capacity = 64, 262144
+
+        def result(input_len, max_new_tokens=8, prefix_len=0):
+            self.mock_tree_cache.sliding_window_size = 1024
+            self.mock_tree_cache.supports_mamba.return_value = False
+            self.mock_tree_cache.full_evictable_size.return_value = 0
+            self.mock_tree_cache.swa_evictable_size.return_value = 0
+            self.mock_token_allocator = self.create_token_allocator(
+                full_available_size=capacity, swa_available_size=4096, size_swa=4096
+            )
+            self.mock_token_allocator.mock_add_spec(SWATokenToKVPoolAllocator)
+            self.mock_token_allocator.swa_req_ring = False
+            self.mock_token_allocator.create_prefill_budget.side_effect = (
+                lambda tree_cache, **kwargs: SWAPrefillBudget(
+                    self.mock_token_allocator, tree_cache, **kwargs
+                )
+            )
+            adder = self.create_adder(
+                self.create_running_batch(), page_size=page_size, rem_chunk_tokens=1024
+            )
+            req = self.create_shared_req(
+                f"boundary-{input_len}", max_new_tokens=max_new_tokens
+            )
+            req.full_untruncated_fill_ids = list(range(input_len))
+            req.prefix_len = prefix_len
+            return adder.add_one_req(
+                req, has_chunked_req=False, truncation_align_size=None
+            )
+
+        self.assertNotEqual(result(262073), AddReqResult.NO_TOKEN)
+        self.assertNotEqual(result(262137), AddReqResult.NO_TOKEN)
+        self.assertEqual(result(262138), AddReqResult.NO_TOKEN)
+        # A 60-token prefix ends mid-page: the extension's first 4 tokens fill
+        # that page, so 262,141 + 7 more tokens need exactly the remaining pool.
+        self.assertNotEqual(result(262201, prefix_len=60), AddReqResult.NO_TOKEN)
+        self.assertEqual(result(262202, prefix_len=60), AddReqResult.NO_TOKEN)
+
+    def test_new_tokens_for_alloc_counts_pages_beyond_the_prefix(self):
+        self.assertEqual(new_tokens_for_alloc(60, 10, 64), 64)
+        self.assertEqual(new_tokens_for_alloc(64, 64, 64), 64)
+        self.assertEqual(new_tokens_for_alloc(0, 15, 4), 16)
+        self.assertEqual(new_tokens_for_alloc(3, 5, 1), 5)
 
     def test_shared_admission_rechecks_after_prefix_lock(self):
         adder = self.create_shared_adder()

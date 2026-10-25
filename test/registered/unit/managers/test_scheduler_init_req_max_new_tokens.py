@@ -21,8 +21,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
       1. context: input_len + max_new_tokens - 1 <= max_req_len; the final
          sampled token is returned without being written to the KV cache
       2. admission budget (PrefillAdder):
-         ceil_page(input_len) + max_new_tokens + page_size * shard_widening
-         < max_total_num_tokens * shard_widening
+         input_len + max_new_tokens - 1 + page_size * shard_widening * (shard_widening > 1)
+         <= max_total_num_tokens * shard_widening (the pool is page-aligned)
       3. env limit: <= SGLANG_MAX_NEW_TOKENS_LIMIT when set and positive
       4. never above the requested value
       5. min_new_tokens <= max_new_tokens afterwards
@@ -93,15 +93,17 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         input_len = len(req.origin_input_ids)
         page_size = scheduler.page_size
         shard_widening = scheduler.kv_shard_widening
-        paged_input_len = -(-input_len // page_size) * page_size
         limit = scheduler.max_new_tokens_limit
         limit_active = limit is not None and limit > 0
 
         def satisfies_rules(candidate: int) -> bool:
             context_ok = input_len + candidate - 1 <= scheduler.max_req_len
             budget_ok = (
-                paged_input_len + candidate + page_size * shard_widening
-                < scheduler.max_total_num_tokens * shard_widening
+                input_len
+                + candidate
+                - 1
+                + page_size * shard_widening * (shard_widening > 1)
+                <= scheduler.max_total_num_tokens * shard_widening
             )
             limit_ok = not limit_active or candidate <= limit
             requested_ok = requested is None or candidate <= requested
@@ -156,10 +158,9 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 max_total_num_tokens=max_total_num_tokens, page_size=page_size
             )
             req = self._new_req(max_new_tokens=64, input_len=input_len)
-            paged_input_len = -(-input_len // page_size) * page_size
             self.assertEqual(
                 self._init_and_check(scheduler, req),
-                max_total_num_tokens - paged_input_len - page_size - 1,
+                max_total_num_tokens - input_len + 1,
             )
 
     def test_dcp_budget_is_already_in_logical_tokens(self):
@@ -167,7 +168,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             scheduler = self._new_scheduler(max_total_num_tokens=24, page_size=4)
             req = self._new_req(max_new_tokens=64, input_len=8)
 
-            self.assertEqual(self._init_and_check(scheduler, req), 11)
+            self.assertEqual(self._init_and_check(scheduler, req), 17)
 
     def test_sharded_budget_reserves_one_page_per_shard(self):
         max_total_num_tokens, page_size, input_len, shard_widening = 8, 4, 8, 3
@@ -185,12 +186,21 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         per_req_overhead = page_size * shard_widening
         self.assertEqual(
             max_new_tokens,
-            widened_capacity - input_len - per_req_overhead - 1,
+            widened_capacity - input_len - per_req_overhead + 1,
         )
-        self.assertLess(
-            input_len + max_new_tokens + per_req_overhead,
+        self.assertLessEqual(
+            input_len + max_new_tokens - 1 + per_req_overhead,
             widened_capacity,
         )
+
+    def test_clip_fills_the_context_exactly(self):
+        scheduler = self._new_scheduler(
+            max_req_len=262143, max_total_num_tokens=262144, page_size=64
+        )
+        for input_len, expected in ((262135, 9), (262136, 8), (262137, 7)):
+            with self.subTest(input_len=input_len):
+                req = self._new_req(max_new_tokens=10, input_len=input_len)
+                self.assertEqual(self._init_and_check(scheduler, req), expected)
 
     def test_min_new_tokens_clamped_to_limit(self):
         with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(16):

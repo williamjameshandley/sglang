@@ -342,7 +342,7 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
                 sliding_window_size=8,
                 chunk_size=16,
             ),
-            19,
+            28,
         )
 
     def test_tri_pool_eviction_does_not_reenter_common(self):
