@@ -4719,8 +4719,8 @@ class Scheduler(
                     # future_map relay / on_publish).
                     resolve_forward_inputs(batch, self.future_map)
                     with self._forward_isolation(batch, overlap=False):
-                        # The V2 spec workers take no PP proxies; pass them only
-                        # when a previous stage supplied some.
+                        # The frozen-KV MTP and UNO workers take no PP proxies;
+                        # pass them only when a previous stage supplied some.
                         batch_result = self.model_worker.forward_batch_generation(
                             batch,
                             **(

@@ -225,6 +225,8 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 (262124, 9),
                 (262131, 2),
                 (262132, 1),
+                (262133, 1),
+                (262142, 1),
                 (262143, 1),
                 (262144, 0),
             ):
