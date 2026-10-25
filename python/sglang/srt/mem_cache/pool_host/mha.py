@@ -202,9 +202,14 @@ class MHATokenToKVPoolHost(HostKVCache):
             v_transposed = self.v_buffer.transpose(0, 1)
             self.k_data_refs = [k_transposed[i] for i in range(self.layer_num)]
             self.v_data_refs = [v_transposed[i] for i in range(self.layer_num)]
-        else:
+        elif self.layout == "layer_first":
             self.k_data_refs = [self.k_buffer[i] for i in range(self.layer_num)]
             self.v_data_refs = [self.v_buffer[i] for i in range(self.layer_num)]
+        else:
+            # Direct layouts are [page, layer, ...]; indexing dim 0 by layer fails
+            # when pages < layers, and their transfer path never reads these views.
+            self.k_data_refs = []
+            self.v_data_refs = []
         self.k_data_ptrs = make_kernel_ptr_table(
             self.k_data_refs,
             self._transfer_device,

@@ -63,6 +63,33 @@ class TestHostKVCache(CustomTestCase):
             allocator_type="default",
         )
 
+    def test_page_first_direct_does_not_build_layer_views(self):
+        # A direct-layout host pool with fewer pages than layers must construct;
+        # its per-layer views were indexed into the page dimension.
+        device_pool = MHATokenToKVPool(
+            size=self.page_size * 2,
+            page_size=self.page_size,
+            dtype=torch.float16,
+            head_num=2,
+            head_dim=4,
+            layer_num=16,
+            device="cpu",
+            enable_memory_saver=False,
+        )
+        host_pool = MHATokenToKVPoolHost(
+            device_pool=device_pool,
+            host_to_device_ratio=1.0,
+            host_size=0,
+            page_size=self.page_size,
+            layout="page_first_direct",
+            pin_memory=False,
+            device="cpu",
+            allocator_type="default",
+        )
+        self.assertLess(host_pool.page_num, host_pool.layer_num)
+        self.assertEqual(host_pool.k_data_refs, [])
+        self.assertEqual(host_pool.v_data_refs, [])
+
     def test_packed_transfers_use_captured_target_and_draft_buffers(self):
         """Target and draft rows retain their bound destinations during transfer."""
 
