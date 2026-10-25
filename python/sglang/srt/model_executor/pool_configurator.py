@@ -252,9 +252,12 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
+        # A frozen-KV MTP draft reads the target's KV and allocates none of its own.
         if (
-            kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
-        ) and not kvc.is_draft_worker:
+            (kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone())
+            and not kvc.spec_algorithm.is_frozen_kv_mtp()
+            and not kvc.is_draft_worker
+        ):
             eagle_draft_num_layers = kvc.spec_aux_config.eagle_draft_num_layers
             fused_full_entry = kvc.fused_entry_bytes("full")
             if fused_full_entry is not None:
@@ -703,13 +706,16 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                 * (model_config.swa_head_dim + model_config.swa_v_head_dim)
             ) // scale_block_size
 
-        # Draft KV tensors use full, SWA, or full-capacity SWA geometry.
+        # Draft KV tensors use full, SWA, or full-capacity SWA geometry. A frozen-KV
+        # MTP draft reads the target's KV and allocates none of its own.
         self._draft_full_layers_num = 0
         self._draft_swa_layers_num = 0
         self._draft_swa_full_layers_num = 0
         if (
-            kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
-        ) and not kvc.is_draft_worker:
+            (kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone())
+            and not kvc.spec_algorithm.is_frozen_kv_mtp()
+            and not kvc.is_draft_worker
+        ):
             draft_layers = kvc.spec_aux_config.eagle_draft_num_layers
             if draft_layers is not None and int(draft_layers) > 0:
                 draft_layers = int(draft_layers)

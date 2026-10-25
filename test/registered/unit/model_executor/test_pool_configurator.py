@@ -170,6 +170,7 @@ def _make_model_runner(
     spec.is_standalone.return_value = False
     spec.is_dflash.return_value = False
     spec.is_dflash_family.return_value = False
+    spec.is_frozen_kv_mtp.return_value = False
     spec.is_none.return_value = True
     mr.spec_algorithm = spec
 
@@ -400,6 +401,26 @@ class TestDefaultConfigurator(CustomTestCase):
             fused = create_memory_pool_configurator(mr)
         self.assertEqual(fused._cell_size, 77777)
 
+    def test_frozen_kv_mtp_draft_adds_no_kv_per_token(self):
+        """A frozen-KV MTP draft reads the target's KV and owns none, so it
+        must not be priced as an EAGLE draft (four extra layers per token on
+        Gemma 4 cost a third of the pool)."""
+        base = _make_model_runner(self)
+        frozen = _make_model_runner(self, speculative_algorithm="EAGLE")
+        frozen.spec_algorithm.is_eagle.return_value = True
+        frozen.spec_algorithm.is_frozen_kv_mtp.return_value = True
+        frozen.spec_algorithm.is_none.return_value = False
+        frozen.spec_aux_config.eagle_draft_num_layers = 4
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            self.assertEqual(
+                create_memory_pool_configurator(frozen)._cell_size,
+                create_memory_pool_configurator(base)._cell_size,
+            )
+
 
 class TestHybridSWAConfigurator(CustomTestCase):
     """Hybrid SWA: full/swa split, ratio, memory invariant."""
@@ -465,6 +486,27 @@ class TestHybridSWAConfigurator(CustomTestCase):
         self.assertEqual(
             draft.swa_max_total_num_tokens, config.swa_max_total_num_tokens
         )
+
+    def test_frozen_kv_mtp_draft_has_no_layers_in_the_hybrid_geometry(self):
+        mr = _make_model_runner(
+            self,
+            is_hybrid_swa=True,
+            full_attention_layer_ids=[0, 1],
+            swa_attention_layer_ids=[2],
+            speculative_algorithm="EAGLE",
+        )
+        mr.spec_algorithm.is_eagle.return_value = True
+        mr.spec_algorithm.is_frozen_kv_mtp.return_value = True
+        mr.spec_algorithm.is_none.return_value = False
+        mr.spec_aux_config.eagle_draft_num_layers = 4
+        with mock_cpu_env():
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            configurator = create_memory_pool_configurator(mr)
+        self.assertEqual(configurator._draft_full_layers_num, 0)
+        self.assertEqual(configurator._draft_swa_layers_num, 0)
 
     def test_unified_capacity_is_maximal_with_draft_pool(self):
         page_size = 8
