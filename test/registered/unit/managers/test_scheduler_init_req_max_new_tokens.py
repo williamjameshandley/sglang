@@ -218,7 +218,16 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         with patch.object(
             scheduler_module, "get_alloc_reserve_per_decode", return_value=12
         ):
-            for input_len, expected in ((262123, 10), (262124, 9), (262133, 0)):
+            # Past the reserve a request keeps one output token, which needs no
+            # decode step; the context still fills exactly (262,143 + 1).
+            for input_len, expected in (
+                (262123, 10),
+                (262124, 9),
+                (262131, 2),
+                (262132, 1),
+                (262143, 1),
+                (262144, 0),
+            ):
                 with self.subTest(input_len=input_len):
                     req = self._new_req(max_new_tokens=10, input_len=input_len)
                     scheduler.init_req_max_new_tokens(req)

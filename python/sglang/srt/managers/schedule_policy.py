@@ -1355,11 +1355,14 @@ class PrefillAdder:
         )
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         # The final sampled token is returned without a KV slot; count the pages
-        # alloc_extend will add beyond the prefix's last page.
+        # alloc_extend will add beyond the prefix's last page. Only a request
+        # that decodes (two or more output tokens) needs the verify slots.
         total_tokens = (
             new_tokens_for_alloc(
                 req.prefix_len,
-                cand_extend_input_len + max(max_new - 1, 0) + self.spec_decode_reserve,
+                cand_extend_input_len
+                + max(max_new - 1, 0)
+                + (self.spec_decode_reserve if max_new > 1 else 0),
                 self.page_size,
             )
             + self.kv_shard_token_reserve

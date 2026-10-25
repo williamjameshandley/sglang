@@ -2613,11 +2613,7 @@ class Scheduler(
         token_capacity = self.max_total_num_tokens * self.kv_shard_widening
         if self.kv_shard_widening > 1:
             token_capacity -= self.page_size * self.kv_shard_widening
-        if not self.spec_algorithm.is_none():
-            # Every decode step allocates the verify slots ahead of the committed
-            # length (new_tokens_required_next_decode); budget them so a request
-            # that fills the pool is clipped rather than retracted into an abort.
-            token_capacity -= get_alloc_reserve_per_decode()
+        decode_max_new_tokens = max_new_tokens
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
@@ -2625,6 +2621,23 @@ class Scheduler(
             sliding_window_size=self.sliding_window_size,
             chunk_size=self.chunked_prefill_size,
         )
+        if max_new_tokens is not None and max_new_tokens > 1:
+            if not self.spec_algorithm.is_none():
+                # A request that decodes allocates the verify slots ahead of its
+                # committed length at every step (new_tokens_required_next_decode);
+                # budget them so it is clipped rather than retracted into an abort.
+                # One output token or none needs no decode step and no reserve.
+                spec_max_new_tokens = (
+                    self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
+                        input_len,
+                        decode_max_new_tokens,
+                        token_capacity=token_capacity
+                        - get_alloc_reserve_per_decode(),
+                        sliding_window_size=self.sliding_window_size,
+                        chunk_size=self.chunked_prefill_size,
+                    )
+                )
+                max_new_tokens = max(spec_max_new_tokens or 0, 1)
         if max_new_tokens is None:
             req.set_finish_with_abort(
                 f"Request prompt exceeds the KV memory budget: input_len={input_len}."

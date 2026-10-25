@@ -438,6 +438,12 @@ class TestPrefillAdder(CustomTestCase):
             result(262125, spec_decode_reserve=12), AddReqResult.NO_TOKEN
         )
         self.assertEqual(result(262126, spec_decode_reserve=12), AddReqResult.NO_TOKEN)
+        # One output token needs no decode step, so no verify slots: the pool
+        # still fills exactly under speculation.
+        self.assertNotEqual(
+            result(262144, max_new_tokens=1, spec_decode_reserve=12),
+            AddReqResult.NO_TOKEN,
+        )
 
     def test_new_tokens_for_alloc_counts_pages_beyond_the_prefix(self):
         self.assertEqual(new_tokens_for_alloc(60, 10, 64), 64)
