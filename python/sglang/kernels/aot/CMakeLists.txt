@@ -177,6 +177,7 @@ option(SGL_KERNEL_ENABLE_FP8              "Enable FP8"              ON)
 option(SGL_KERNEL_ENABLE_FP4              "Enable FP4"              OFF)
 option(SGL_KERNEL_ENABLE_FA3              "Enable FA3"              ${DEFAULT_SGL_KERNEL_ENABLE_FA3})
 option(SGL_KERNEL_ENABLE_FA3_SPARSE_MASK  "Enable FA3 sparse mask kernels" OFF)
+option(SGL_KERNEL_ENABLE_FLASHMLA         "Enable FlashMLA"         ON)
 option(SGL_KERNEL_ENABLE_SM90A            "Enable SM90A"            OFF)
 option(SGL_KERNEL_ENABLE_SM100A           "Enable SM100A"           OFF)
 
@@ -544,7 +545,9 @@ target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
 install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
 
 # ============================ Extra Install: FLashMLA ============================= #
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+if (SGL_KERNEL_ENABLE_FLASHMLA)
+    include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
+endif()
 
 # ============================ Extra Install: triton kernels ============================= #
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
