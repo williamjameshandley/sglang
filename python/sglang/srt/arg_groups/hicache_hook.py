@@ -225,6 +225,12 @@ def validate_hicache_host_memory_mode(server_args: Any):
             "--hicache-ratio."
         )
 
+    if cfg.hicache_swa_size != 0 and not 0 < cfg.hicache_swa_size < cfg.hicache_size:
+        raise ValueError(
+            f"--hicache-swa-size {cfg.hicache_swa_size} must be positive and below "
+            f"--hicache-size {cfg.hicache_size}."
+        )
+
     if cfg.hicache_host_memory_mode == "cache":
         return
 

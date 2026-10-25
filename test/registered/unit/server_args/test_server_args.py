@@ -2126,6 +2126,25 @@ class TestHiCacheArgs(CustomTestCase):
                 else:
                     handle_hicache(args)
 
+    def test_hicache_swa_size_must_fit_inside_hicache_size(self):
+        for size, swa_size, ok in (
+            (8, 4, True),
+            (8, 0, True),
+            (0, 4, False),
+            (8, 8, False),
+        ):
+            with self.subTest(size=size, swa_size=swa_size):
+                args = self._make_args(
+                    enable_hierarchical_cache=True,
+                    hicache_size=size,
+                    hicache_swa_size=swa_size,
+                )
+                if ok:
+                    handle_hicache(args)
+                else:
+                    with self.assertRaisesRegex(ValueError, "--hicache-swa-size"):
+                        handle_hicache(args)
+
     def _make_args(self, **overrides) -> ServerArgs:
         # Not resolved: a dummy model path takes the pipeline's early return,
         # so `_handle_hicache` would never run. Its one prerequisite (the
