@@ -4697,8 +4697,15 @@ class Scheduler(
                     # future_map relay / on_publish).
                     resolve_forward_inputs(batch, self.future_map)
                     with self._forward_isolation(batch, overlap=False):
+                        # The V2 spec workers take no PP proxies; pass them only
+                        # when a previous stage supplied some.
                         batch_result = self.model_worker.forward_batch_generation(
-                            batch, pp_proxy_tensors=pp_proxy_tensors
+                            batch,
+                            **(
+                                {"pp_proxy_tensors": pp_proxy_tensors}
+                                if pp_proxy_tensors is not None
+                                else {}
+                            ),
                         )
                     # The isolation restore reverted the worker's in-forward SB edits;
                     # re-apply what must carry to the next iter. Under PP the
