@@ -601,6 +601,7 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        spec_decode_reserve: int = 0,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -707,6 +708,9 @@ class PrefillAdder:
             kv_shard_size * self.kv_shard_granule if self.kv_shard_granule else 0
         )
         self.per_req_token_overhead = self.kv_shard_token_reserve or self.page_size
+        # Speculative decode allocates its verify slots ahead of the committed
+        # length at every step; admit only what leaves room for them.
+        self.spec_decode_reserve = spec_decode_reserve
         self.prefill_max_requests = prefill_max_requests
         self.prefill_delayer_single_pass = prefill_delayer_single_pass
         self.max_prefill_bs = max_prefill_bs
@@ -1355,7 +1359,7 @@ class PrefillAdder:
         total_tokens = (
             new_tokens_for_alloc(
                 req.prefix_len,
-                cand_extend_input_len + max(max_new - 1, 0),
+                cand_extend_input_len + max(max_new - 1, 0) + self.spec_decode_reserve,
                 self.page_size,
             )
             + self.kv_shard_token_reserve

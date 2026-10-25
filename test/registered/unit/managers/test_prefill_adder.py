@@ -395,7 +395,7 @@ class TestPrefillAdder(CustomTestCase):
         KV slots, page-ceiled, and no page beyond that is reserved."""
         page_size, capacity = 64, 262144
 
-        def result(input_len, max_new_tokens=8, prefix_len=0):
+        def result(input_len, max_new_tokens=8, prefix_len=0, spec_decode_reserve=0):
             self.mock_tree_cache.sliding_window_size = 1024
             self.mock_tree_cache.supports_mamba.return_value = False
             self.mock_tree_cache.full_evictable_size.return_value = 0
@@ -411,7 +411,10 @@ class TestPrefillAdder(CustomTestCase):
                 )
             )
             adder = self.create_adder(
-                self.create_running_batch(), page_size=page_size, rem_chunk_tokens=1024
+                self.create_running_batch(),
+                page_size=page_size,
+                rem_chunk_tokens=1024,
+                spec_decode_reserve=spec_decode_reserve,
             )
             req = self.create_shared_req(
                 f"boundary-{input_len}", max_new_tokens=max_new_tokens
@@ -429,6 +432,12 @@ class TestPrefillAdder(CustomTestCase):
         # that page, so 262,141 + 7 more tokens need exactly the remaining pool.
         self.assertNotEqual(result(262201, prefix_len=60), AddReqResult.NO_TOKEN)
         self.assertEqual(result(262202, prefix_len=60), AddReqResult.NO_TOKEN)
+        # Speculative decoding allocates 2 * max(steps * topk, draft tokens) = 12
+        # verify slots ahead of the committed length at every decode step.
+        self.assertNotEqual(
+            result(262125, spec_decode_reserve=12), AddReqResult.NO_TOKEN
+        )
+        self.assertEqual(result(262126, spec_decode_reserve=12), AddReqResult.NO_TOKEN)
 
     def test_new_tokens_for_alloc_counts_pages_beyond_the_prefix(self):
         self.assertEqual(new_tokens_for_alloc(60, 10, 64), 64)

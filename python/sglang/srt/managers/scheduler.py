@@ -293,6 +293,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
@@ -2612,6 +2613,11 @@ class Scheduler(
         token_capacity = self.max_total_num_tokens * self.kv_shard_widening
         if self.kv_shard_widening > 1:
             token_capacity -= self.page_size * self.kv_shard_widening
+        if not self.spec_algorithm.is_none():
+            # Every decode step allocates the verify slots ahead of the committed
+            # length (new_tokens_required_next_decode); budget them so a request
+            # that fills the pool is clipped rather than retracted into an abort.
+            token_capacity -= get_alloc_reserve_per_decode()
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
@@ -4048,6 +4054,9 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            spec_decode_reserve=(
+                0 if self.spec_algorithm.is_none() else get_alloc_reserve_per_decode()
+            ),
         )
 
         if self.chunked_req is not None:

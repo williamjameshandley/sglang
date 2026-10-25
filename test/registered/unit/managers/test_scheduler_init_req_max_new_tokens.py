@@ -1,6 +1,7 @@
 import logging
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -8,7 +9,9 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -64,6 +67,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         scheduler.sliding_window_size = None
         scheduler.chunked_prefill_size = None
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
             size=max_total_num_tokens,
             dtype=torch.int64,
@@ -201,6 +205,24 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             with self.subTest(input_len=input_len):
                 req = self._new_req(max_new_tokens=10, input_len=input_len)
                 self.assertEqual(self._init_and_check(scheduler, req), expected)
+
+    def test_clip_leaves_the_speculative_verify_slots(self):
+        """Under speculative decoding every decode step allocates its verify
+        slots ahead of the committed length; a request budgeted to the last
+        slot was admitted and then aborted as out of memory at its first step."""
+        scheduler = self._new_scheduler(
+            max_req_len=262143, max_total_num_tokens=262144, page_size=64
+        )
+        scheduler.spec_algorithm = SpeculativeAlgorithm.EAGLE
+        # 2 * max(steps * topk, draft tokens) for 5 steps, top-k 1, 6 drafts
+        with patch.object(
+            scheduler_module, "get_alloc_reserve_per_decode", return_value=12
+        ):
+            for input_len, expected in ((262123, 10), (262124, 9), (262133, 0)):
+                with self.subTest(input_len=input_len):
+                    req = self._new_req(max_new_tokens=10, input_len=input_len)
+                    scheduler.init_req_max_new_tokens(req)
+                    self.assertEqual(req.sampling_params.max_new_tokens, expected)
 
     def test_min_new_tokens_clamped_to_limit(self):
         with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(16):

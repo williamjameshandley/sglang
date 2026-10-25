@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
@@ -178,6 +179,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
         scheduler.max_new_tokens_limit = None
         scheduler.sliding_window_size = page_size
         scheduler.chunked_prefill_size = page_size
+        scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.token_to_kv_pool_allocator = allocator
         with get_parallel().override(attn_dcp_size=1):
             scheduler.init_req_max_new_tokens(req)
