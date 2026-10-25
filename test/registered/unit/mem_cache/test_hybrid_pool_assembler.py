@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _MambaStrategy,
     _MambaSwaStrategy,
     _require_single_row_dsv4_swa_pages,
+    _hybrid_swa_host_sizes,
     _split_hicache_size,
     _SwaStrategy,
     _uses_unified_page_envelope_host,
@@ -122,6 +123,15 @@ class TestSplitHicacheSize(CustomTestCase):
         )
         self.assertEqual(shares, (55.0, 25.0, 20.0))  # proportional to device KV bytes
         self.assertEqual(sum(shares), 100)  # total budget preserved, not doubled
+
+
+class TestHybridSWAHostSizes(CustomTestCase):
+    def test_explicit_swa_share_comes_out_of_the_total(self):
+        pools = (_Pool(75 * 10**9), _Pool(25 * 10**9))
+        self.assertEqual(_hybrid_swa_host_sizes(8, 4, pools), (4.0, 4.0))
+        self.assertEqual(_hybrid_swa_host_sizes(100, 0, pools), (75.0, 25.0))
+        with self.assertRaises(ValueError):
+            _hybrid_swa_host_sizes(8, 8, pools)
 
 
 class TestHybridStageLayerMappings(CustomTestCase):

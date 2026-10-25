@@ -198,6 +198,20 @@ def _split_hicache_size(
     )
 
 
+def _hybrid_swa_host_sizes(
+    hicache_size: int, hicache_swa_size: int, kv_pools: tuple[Any, Any]
+) -> tuple[float, float]:
+    """Full and SWA host sizes in GB: an explicit SWA share, else by device bytes."""
+    if hicache_swa_size <= 0:
+        return _split_hicache_size(hicache_size, kv_pools)
+    if hicache_swa_size >= hicache_size:
+        raise ValueError(
+            f"--hicache-swa-size {hicache_swa_size} must be below "
+            f"--hicache-size {hicache_size}"
+        )
+    return float(hicache_size - hicache_swa_size), float(hicache_swa_size)
+
+
 def build_pool_entry(
     *,
     name: PoolName,
@@ -543,8 +557,10 @@ def build_hybrid_swa_stack(
     if memory.hicache_size > 0 and not _uses_unified_page_envelope_host(
         full_kv_pool, swa_kv_pool, use_mla, params.mtp_draft_device_pools
     ):
-        kv_host_size, swa_host_size = _split_hicache_size(
-            memory.hicache_size, (full_kv_pool, swa_kv_pool)
+        kv_host_size, swa_host_size = _hybrid_swa_host_sizes(
+            memory.hicache_size,
+            memory.hicache_swa_size,
+            (full_kv_pool, swa_kv_pool),
         )
 
     host_pool_group = build_hybrid_swa_group(
